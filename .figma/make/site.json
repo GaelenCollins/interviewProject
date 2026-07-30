@@ -1,0 +1,11 @@
+{
+  "title": "Dynamix Sales Quote Checker",
+  "description": "Automates checking of distributor Excel and customer PDF sales quotes to identify pricing and term errors, enhancing accuracy for sales teams.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
