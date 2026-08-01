@@ -4,11 +4,12 @@ import cors from 'cors'
 import multer from 'multer'
 import { runQuoteCheck, streamChat } from './services/pipeline.js'
 import { MODELS } from './services/claude.js'
+import { MAX_FILE_BYTES } from '../src/utils/ingestGuards.js'
 
 const app = express()
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 40 * 1024 * 1024 },
+  limits: { fileSize: MAX_FILE_BYTES },
 })
 
 app.use(cors())
@@ -30,10 +31,29 @@ app.get('/api/health', (_req, res) => {
 
 app.post(
   '/api/check',
-  upload.fields([
-    { name: 'pdf', maxCount: 1 },
-    { name: 'excel', maxCount: 1 },
-  ]),
+  (req, res, next) => {
+    upload.fields([
+      { name: 'pdf', maxCount: 1 },
+      { name: 'excel', maxCount: 1 },
+    ])(req, res, (err) => {
+      if (!err) return next()
+      const wantsStream =
+        String(req.query.stream || '') === '1' ||
+        req.headers.accept?.includes('text/event-stream')
+      const message =
+        err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE'
+          ? 'File exceeds the 15MB limit. Please upload a smaller file.'
+          : err.message || 'Upload failed'
+      if (wantsStream) {
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+        res.setHeader('Cache-Control', 'no-cache, no-transform')
+        res.flushHeaders?.()
+        writeSse(res, 'error', { error: message })
+        return res.end()
+      }
+      return res.status(400).json({ error: message })
+    })
+  },
   async (req, res) => {
     const wantsStream = String(req.query.stream || '') === '1' || req.headers.accept?.includes('text/event-stream')
 
@@ -72,13 +92,14 @@ app.post(
       res.json(result)
     } catch (err) {
       console.error('[api/check]', err)
+      const message = err.message || 'Quote check failed'
       if (wantsStream && !res.headersSent) {
-        res.status(500).json({ error: err.message || 'Quote check failed' })
+        res.status(500).json({ error: message })
       } else if (wantsStream) {
-        writeSse(res, 'error', { error: err.message || 'Quote check failed' })
+        writeSse(res, 'error', { error: message })
         res.end()
       } else {
-        res.status(500).json({ error: err.message || 'Quote check failed' })
+        res.status(500).json({ error: message })
       }
     }
   },

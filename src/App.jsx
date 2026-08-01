@@ -112,9 +112,33 @@ export default function App() {
         true,
       )
     } catch (err) {
-      setCheckError(err.message || 'Check failed')
+      const msg = err.message || 'Check failed'
+      setCheckError(msg)
+      setSessionId(null)
+      setErrors([
+        {
+          id: 1,
+          type: /unrecognized|not match|sales quote/i.test(msg)
+            ? 'UNRECOGNIZED_DOCUMENT'
+            : /project mismatch|0 matching|unrelated/i.test(msg)
+              ? 'PROJECT_MISMATCH'
+              : 'CHECK_FAILED',
+          severity: 'CRITICAL',
+          message: msg.startsWith('CRITICAL') ? msg : `CRITICAL: ${msg}`,
+          sku: null,
+          page: 1,
+          hidden: false,
+          actions: [],
+        },
+      ])
+      const isDocIssue =
+        /unrecognized|password|scanned|encrypted|15MB|project mismatch|unrelated|sales quote|SNAP/i.test(
+          msg,
+        )
       upsertStreamingAssistant(
-        `Something went wrong: ${err.message || 'Unknown error'}. Make sure the API is running and ANTHROPIC_API_KEY is set.`,
+        isDocIssue
+          ? msg
+          : `Something went wrong: ${msg}. Make sure the API is running and ANTHROPIC_API_KEY is set.`,
         true,
       )
     } finally {

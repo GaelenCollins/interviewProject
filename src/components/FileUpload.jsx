@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Upload, FileSpreadsheet, FileText, X, AlertCircle } from 'lucide-react'
+import { MAX_FILE_BYTES } from '../utils/ingestGuards.js'
 
 function isPdf(file) {
   const name = file.name.toLowerCase()
@@ -22,14 +23,19 @@ function classifyFiles(fileList) {
   let pdf = null
   let excel = null
   const skipped = []
+  const oversized = []
 
   for (const file of fileList) {
+    if (file.size > MAX_FILE_BYTES) {
+      oversized.push(file.name)
+      continue
+    }
     if (isPdf(file) && !pdf) pdf = file
     else if (isExcel(file) && !excel) excel = file
     else skipped.push(file.name)
   }
 
-  return { pdf, excel, skipped }
+  return { pdf, excel, skipped, oversized }
 }
 
 export default function FileUpload({
@@ -48,20 +54,30 @@ export default function FileUpload({
     const classified = classifyFiles(incoming)
     setError('')
 
-    const nextPdf = classified.pdf || pdfFile
-    const nextExcel = classified.excel || excelFile
+    if (classified.oversized.length > 0) {
+      const msg = `File exceeds the 15MB limit: ${classified.oversized.join(', ')}. Please upload a smaller file.`
+      setError(msg)
+      try {
+        window.alert(msg)
+      } catch {
+        /* ignore */
+      }
+    }
 
     if (classified.pdf) setPdfFile(classified.pdf)
     if (classified.excel) setExcelFile(classified.excel)
 
-    if (!classified.pdf && !classified.excel) {
+    if (!classified.pdf && !classified.excel && !classified.oversized.length) {
       setError(
         'Select a Dynamix Customer Quote (PDF) and a Distributor Quote (Excel Source) (.xlsx / .xls) together.',
       )
-      return { pdf: nextPdf, excel: nextExcel }
+      return {
+        pdf: classified.pdf || pdfFile,
+        excel: classified.excel || excelFile,
+      }
     }
 
-    if (classified.skipped.length > 0) {
+    if (classified.skipped.length > 0 && !classified.oversized.length) {
       setError(`Skipped unsupported file(s): ${classified.skipped.join(', ')}`)
     }
 

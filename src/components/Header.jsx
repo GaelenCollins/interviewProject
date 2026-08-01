@@ -31,8 +31,8 @@ export default function Header({ onOpenCalculator, showNewCheck, onNewCheck }) {
           type="button"
           onClick={onOpenCalculator}
           className="w-9 h-9 rounded-lg flex items-center justify-center bg-brand-main text-brand-secondary hover:opacity-90 active:scale-95 transition-all"
-          title="Margin Calculator"
-          aria-label="Open margin calculator"
+          title="Calculator"
+          aria-label="Open calculator"
         >
           <Calculator className="w-[18px] h-[18px]" strokeWidth={1.8} />
         </button>

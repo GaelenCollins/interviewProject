@@ -1,17 +1,32 @@
 import { extractPdfText } from './pdf.js'
 import { parseDistributorExcel } from '../../src/utils/excelParser.js'
 import { EMPTY_PDF_QUOTE } from '../../src/utils/pdfSchema.js'
-import { auditQuote, toNumber } from '../../src/utils/auditEngine.js'
+import {
+  auditQuote,
+  buildBlockedCheckResult,
+  toNumber,
+} from '../../src/utils/auditEngine.js'
 import {
   CUSTOMER_QUOTE,
   DISTRIBUTOR_QUOTE,
 } from '../../src/constants/labels.js'
+import {
+  countPdfLineItems,
+  detectCurrency,
+  looksLikeSnapQuote,
+  MAX_FILE_BYTES,
+  sanitizeSku,
+  toIsoDate,
+} from '../../src/utils/ingestGuards.js'
 import {
   extractPdfSchema,
   streamChatWithSonnet,
   streamInitialAnalysisWithSonnet,
   streamQuickActionWithHaiku,
 } from './claude.js'
+
+const UNRECOGNIZED_PDF_MSG =
+  'This PDF does not look like a Dynamix SNAP Customer Quote. It may be the wrong file, or not a digital sales quote exported from SNAP. Upload the customer quote PDF that belongs with this distributor Excel.'
 
 const sessions = new Map()
 
@@ -41,6 +56,13 @@ export async function runQuoteCheck({
 
   const warnings = []
 
+  if (
+    (excelBuffer?.length || 0) > MAX_FILE_BYTES ||
+    (pdfBuffer?.length || 0) > MAX_FILE_BYTES
+  ) {
+    throw new Error('File exceeds the 15MB limit. Please upload a smaller file.')
+  }
+
   emit('start', 'Got your files. Opening the workspace…')
 
   // Parallel: Excel parse + PDF text extract
@@ -59,48 +81,61 @@ export async function runQuoteCheck({
     )
   }
   const excelData = excelResult.value
-
-  let pdfText = { markdown: '', pages: [], provider: 'unavailable', pageCount: 0 }
-  if (pdfResult.status === 'fulfilled') {
-    pdfText = pdfResult.value
-    emit(
-      'pdf',
-      `${CUSTOMER_QUOTE} text ready (${pdfText.pageCount || pdfText.pages?.length || '?'} pages).`,
-    )
-  } else {
-    warnings.push(
-      `${CUSTOMER_QUOTE} text extraction failed: ${pdfResult.reason?.message || pdfResult.reason}`,
-    )
-    emit(
-      'pdf',
-      `${CUSTOMER_QUOTE} text extraction hit a snag; continuing with what we have…`,
+  if (!excelData.currency) {
+    excelData.currency = detectCurrency(
+      `${excelData.notes || ''}\n${excelData.supplierQuoteNumber || ''}`,
     )
   }
+
+  // Password / scanned / empty PDF must stop the pipeline with a clear banner
+  if (pdfResult.status !== 'fulfilled') {
+    throw new Error(
+      pdfResult.reason?.message ||
+        `${CUSTOMER_QUOTE} text extraction failed.`,
+    )
+  }
+  const pdfText = pdfResult.value
+  emit(
+    'pdf',
+    `${CUSTOMER_QUOTE} text ready (${pdfText.pageCount || pdfText.pages?.length || '?'} pages).`,
+  )
 
   // Dual-stage schema: Haiku → Sonnet → regex
   let pdfData = { ...EMPTY_PDF_QUOTE }
-  if (pdfText.markdown) {
-    emit('schema', `Structuring the ${CUSTOMER_QUOTE}…`)
-    try {
-      const extracted = await extractPdfSchema(pdfText.markdown)
-      pdfData = extracted.pdfData
-      if (extracted.fallbackFrom === 'haiku') {
-        warnings.push(
-          `${CUSTOMER_QUOTE} Haiku schema failed (${extracted.haikuError || 'invalid JSON'}); used Sonnet.`,
-        )
-        emit('schema', `${CUSTOMER_QUOTE} structure ready (Sonnet fallback).`)
-      } else {
-        emit('schema', `${CUSTOMER_QUOTE} structure ready.`)
-      }
-    } catch (err) {
-      warnings.push(`${CUSTOMER_QUOTE} schema extraction failed: ${err.message}`)
-      pdfData = regexFallbackPdf(pdfText.markdown)
-      emit('schema', `Fell back to a lighter ${CUSTOMER_QUOTE} parse.`)
+  emit('schema', `Structuring the ${CUSTOMER_QUOTE}…`)
+  try {
+    const extracted = await extractPdfSchema(pdfText.markdown)
+    pdfData = extracted.pdfData
+    if (extracted.fallbackFrom === 'haiku') {
+      warnings.push(
+        `${CUSTOMER_QUOTE} Haiku schema failed (${extracted.haikuError || 'invalid JSON'}); used Sonnet.`,
+      )
+      emit('schema', `${CUSTOMER_QUOTE} structure ready (Sonnet fallback).`)
+    } else {
+      emit('schema', `${CUSTOMER_QUOTE} structure ready.`)
     }
+  } catch (err) {
+    warnings.push(`${CUSTOMER_QUOTE} schema extraction failed: ${err.message}`)
+    pdfData = regexFallbackPdf(pdfText.markdown)
+    emit('schema', `Fell back to a lighter ${CUSTOMER_QUOTE} parse.`)
   }
 
-  emit('audit', 'Running deterministic checks…')
-  const auditResult = auditQuote(excelData, pdfData)
+  if (!pdfData.currency) {
+    pdfData.currency = detectCurrency(pdfText.markdown)
+  }
+
+  const unrecognized =
+    countPdfLineItems(pdfData) === 0 ||
+    !looksLikeSnapQuote(pdfText.markdown, pdfData)
+
+  emit('audit', unrecognized ? 'Checking document type…' : 'Running deterministic checks…')
+  const auditResult = unrecognized
+    ? buildBlockedCheckResult({
+        type: 'UNRECOGNIZED_DOCUMENT',
+        message: UNRECOGNIZED_PDF_MSG,
+      })
+    : auditQuote(excelData, pdfData)
+
   emit(
     'audit',
     `Found ${auditResult.summaryCounts.total} issue(s). Writing analysis…`,
@@ -136,28 +171,43 @@ export async function runQuoteCheck({
       meanMarginPercent: auditResult.analysis.meanMarginRounded,
       pdfProvider: pdfText.provider,
       verdict: auditResult.verdict,
+      halted: Boolean(auditResult.analysis?.halted),
+      haltReason: auditResult.analysis?.haltReason || null,
     },
   }
   sessions.set(sessionId, session)
 
-  const quoteDossier = buildQuoteDossier(session)
   let summary = ''
-  try {
-    for await (const token of streamInitialAnalysisWithSonnet({
-      auditResult,
-      quoteDossier,
-      meta: session.meta,
-      warnings,
-    })) {
-      summary += token
+  if (auditResult.analysis?.halted) {
+    const primary = auditResult.errors[0]
+    const detail = String(primary?.message || UNRECOGNIZED_PDF_MSG).replace(
+      /^(CRITICAL|WARNING|NOTICE):\s*/i,
+      '',
+    )
+    summary =
+      primary?.type === 'PROJECT_MISMATCH'
+        ? `These files look unrelated. ${detail}`
+        : `I could not run a normal quote check. ${detail}`
+    emit('summary', summary)
+  } else {
+    const quoteDossier = buildQuoteDossier(session)
+    try {
+      for await (const token of streamInitialAnalysisWithSonnet({
+        auditResult,
+        quoteDossier,
+        meta: session.meta,
+        warnings,
+      })) {
+        summary += token
+        emit('summary', summary)
+      }
+    } catch (err) {
+      warnings.push(`Opening analysis failed: ${err.message || err}`)
+      summary =
+        `I finished the check (${auditResult.summaryCounts.total} finding(s), verdict ${auditResult.verdict}). ` +
+        `Ask me about any SKU or issue and I will walk through the dossier.`
       emit('summary', summary)
     }
-  } catch (err) {
-    warnings.push(`Opening analysis failed: ${err.message || err}`)
-    summary =
-      `I finished the check (${auditResult.summaryCounts.total} finding(s), verdict ${auditResult.verdict}). ` +
-      `Ask me about any SKU or issue and I will walk through the dossier.`
-    emit('summary', summary)
   }
 
   session.chatHistory = [{ role: 'assistant', text: summary }]
@@ -373,8 +423,8 @@ function regexFallbackPdf(markdown) {
   let match
   const seen = new Set()
   while ((match = re.exec(markdown)) !== null) {
-    const sku = match[1]
-    if (seen.has(sku)) continue
+    const sku = sanitizeSku(match[1])
+    if (!sku || seen.has(sku)) continue
     seen.add(sku)
     const unitPrice = toNumber(match[2])
     groups[0].lineItems.push({
@@ -391,17 +441,16 @@ function regexFallbackPdf(markdown) {
     markdown.match(/coterm[^\d]*(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})/i) ||
     markdown.match(/Coverage through\s+(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})/i)
 
-  let cotermDate = null
-  if (coterm) {
-    const yyyy = coterm[3].length === 2 ? `20${coterm[3]}` : coterm[3]
-    cotermDate = `${yyyy}-${coterm[1].padStart(2, '0')}-${coterm[2].padStart(2, '0')}`
-  }
+  const cotermRaw = coterm
+    ? `${coterm[1]}/${coterm[2]}/${coterm[3]}`
+    : null
 
   return {
     quoteNumber: null,
+    currency: detectCurrency(markdown),
     projectHeader: {
       title: null,
-      cotermDate,
+      cotermDate: toIsoDate(cotermRaw),
       expirationDate: null,
     },
     groups,

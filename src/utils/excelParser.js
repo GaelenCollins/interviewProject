@@ -6,6 +6,13 @@
 import * as XLSX from 'xlsx'
 import { toNumber } from './auditEngine.js'
 import { excelColLetter } from './excelCols.js'
+import {
+  detectCurrency,
+  sanitizeSerial,
+  sanitizeSku,
+  sanitizeText,
+  toIsoDate,
+} from './ingestGuards.js'
 
 /**
  * @returns {{
@@ -14,6 +21,7 @@ import { excelColLetter } from './excelCols.js'
  *  lineItems: Array<object>,
  *  totalResellerCost: number|null,
  *  notes: string,
+ *  currency: string|null,
  *  _debug?: object
  * }}
  */
@@ -60,8 +68,7 @@ export function parseDistributorExcel(buffer, filename = '') {
   }
 
   const dataStart = headerIdx >= 0 ? headerIdx + 1 : 0
-  const rawDataRows =
-    headerIdx >= 0 ? rows.slice(dataStart) : []
+  const rawDataRows = headerIdx >= 0 ? rows.slice(dataStart) : []
   const lineItems = extractLineItems(headers, rawDataRows, {
     sheetName,
     dataStartRowIndex: dataStart,
@@ -69,6 +76,8 @@ export function parseDistributorExcel(buffer, filename = '') {
   const totalResellerCost =
     toNumber(pick(/Grand Total[^\d]*([\d,.]+)/i)) ??
     roundSum(lineItems.map((l) => l.resellerExtCost))
+
+  const currency = detectCurrency(`${metaBlob}\n${notes}`)
 
   return {
     supplierQuoteNumber:
@@ -81,6 +90,7 @@ export function parseDistributorExcel(buffer, filename = '') {
     lineItems,
     totalResellerCost,
     notes,
+    currency,
     sheetName,
     _debug: {
       filename,
@@ -99,14 +109,12 @@ function parseDiscountPercent(rawValue, header = '') {
   }
   const n = toNumber(rawValue)
   if (n == null) return null
-  // Header marked as % → keep as percentage points (0.16 means 0.16%)
   if (/%/.test(String(header || ''))) return n
-  // Plain decimals usually mean fractions (0.16 → 16%)
   if (n > 0 && n <= 1) return n * 100
   return n
 }
 
-export { excelColLetter }
+export { excelColLetter, toIsoDate }
 
 function findHeaderRow(rows) {
   for (let i = 0; i < Math.min(rows.length, 40); i++) {
@@ -146,7 +154,7 @@ function extractLineItems(headers, dataRows, { sheetName = null, dataStartRowInd
 
     const skuRaw = row[skuI]
     if (skuRaw == null) continue
-    const sku = String(skuRaw).trim()
+    const sku = sanitizeSku(skuRaw)
     if (!sku || /^total/i.test(sku)) continue
     if (!/^[A-Z0-9][A-Z0-9._-]{2,}$/i.test(sku)) continue
 
@@ -161,23 +169,17 @@ function extractLineItems(headers, dataRows, { sheetName = null, dataStartRowInd
     const discountPercent =
       discountI >= 0 ? parseDiscountPercent(row[discountI], headers[discountI]) : null
 
-    // 1-based Excel row number on the sheet
     const excelRow = dataStartRowIndex + i + 1
 
     items.push({
       line: lineI >= 0 ? toNumber(row[lineI]) : items.length + 1,
       sku,
-      description: descI >= 0 ? String(row[descI] ?? '').trim() : '',
+      description: descI >= 0 ? sanitizeText(row[descI] ?? '') : '',
       qty,
       resellerUnitCost,
       resellerExtCost,
       discountPercent,
-      serialNumber:
-        serialI >= 0
-          ? String(row[serialI] ?? '')
-              .replace(/\s+/g, ' ')
-              .trim() || null
-          : null,
+      serialNumber: serialI >= 0 ? sanitizeSerial(row[serialI]) : null,
       coverageStart: startI >= 0 ? toIsoDate(row[startI]) : null,
       coverageEnd: endI >= 0 ? toIsoDate(row[endI]) : null,
       sheetName,
@@ -199,35 +201,4 @@ function extractLineItems(headers, dataRows, { sheetName = null, dataStartRowInd
 function roundSum(values) {
   const n = values.reduce((a, v) => a + (toNumber(v) || 0), 0)
   return Math.round(n * 100) / 100
-}
-
-export function toIsoDate(value) {
-  if (value == null || value === '') return null
-  if (value instanceof Date && !Number.isNaN(value.getTime())) {
-    return value.toISOString().slice(0, 10)
-  }
-  const raw = String(value).trim()
-
-  const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})/)
-  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`
-
-  const us = raw.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/)
-  if (us) {
-    const yyyy = us[3].length === 2 ? `20${us[3]}` : us[3]
-    return `${yyyy}-${us[1].padStart(2, '0')}-${us[2].padStart(2, '0')}`
-  }
-
-  const mon = raw.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2,4})$/)
-  if (mon) {
-    const months = {
-      JAN: '01', FEB: '02', MAR: '03', APR: '04', MAY: '05', JUN: '06',
-      JUL: '07', AUG: '08', SEP: '09', OCT: '10', NOV: '11', DEC: '12',
-    }
-    const mm = months[mon[2].toUpperCase()]
-    if (!mm) return null
-    const yyyy = mon[3].length === 2 ? `20${mon[3]}` : mon[3]
-    return `${yyyy}-${mm}-${mon[1].padStart(2, '0')}`
-  }
-
-  return null
 }

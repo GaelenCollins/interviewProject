@@ -124,8 +124,34 @@ function todayYmd() {
 
 function normalizeSku(sku) {
   return String(sku || '')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/[\r\n\t]/g, '')
     .trim()
     .toUpperCase()
+}
+
+function normalizeSerialKey(serial) {
+  if (serial == null || serial === '') return ''
+  return String(serial)
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/[\r\n\t]/g, '')
+    .trim()
+    .toUpperCase()
+}
+
+/** Drop promotional placeholders: qty 0 and cost/price 0. */
+function filterAuditLines(excelItems, pdfLines) {
+  const excel = (excelItems || []).filter((r) => {
+    const qty = toNumber(r.qty) ?? 0
+    const cost = toNumber(r.resellerUnitCost) ?? 0
+    return !(qty === 0 && cost === 0)
+  })
+  const pdf = (pdfLines || []).filter((r) => {
+    const qty = toNumber(r.qty) ?? 0
+    const price = toNumber(r.unitPrice) ?? 0
+    return !(qty === 0 && price === 0)
+  })
+  return { excel, pdf }
 }
 
 /** Structured location for UI + a short plain-text fallback. */
@@ -240,71 +266,136 @@ function flattenPdfLines(pdfData) {
   return out
 }
 
+function pairToComparedRow(excelRow, pdfRow, excelData) {
+  const sku = normalizeSku(pdfRow?.sku || excelRow?.sku)
+  const cost =
+    toNumber(excelRow?.resellerUnitCost) ??
+    toNumber(excelRow?.resellerPrice) ??
+    toNumber(excelRow?.cost)
+  const sell = toNumber(pdfRow?.unitPrice) ?? toNumber(pdfRow?.sell)
+  const excelQty = excelRow != null ? toNumber(excelRow.qty) : null
+  const pdfQty = pdfRow != null ? toNumber(pdfRow.qty) : null
+  const margin = grossMarginPercent(sell, cost)
+  const markup = grossMarkupPercent(sell, cost)
+
+  return {
+    sku,
+    description: pdfRow?.description || excelRow?.description || '',
+    excelQty,
+    pdfQty,
+    qty: pdfQty ?? excelQty,
+    resellerUnitCost: cost,
+    unitPrice: sell,
+    extendedPrice:
+      toNumber(pdfRow?.extendedPrice) ??
+      (sell != null && pdfQty != null ? roundMoney(sell * pdfQty) : null),
+    margin,
+    markup,
+    marginRounded: roundPct(margin),
+    markupRounded: roundPct(markup),
+    page: pdfRow?.page ?? null,
+    line: excelRow?.line ?? null,
+    sheetName: excelRow?.sheetName ?? excelData.sheetName ?? null,
+    excelRow: excelRow?.excelRow ?? null,
+    excelCols: excelRow?.excelCols ?? null,
+    excelSerial: excelRow?.serialNumber ?? null,
+    pdfSerial: pdfRow?.serialNumber ?? null,
+    matchKey:
+      sku && (normalizeSerialKey(excelRow?.serialNumber || pdfRow?.serialNumber) || null)
+        ? `${sku}::${normalizeSerialKey(excelRow?.serialNumber || pdfRow?.serialNumber)}`
+        : sku,
+    coverageEnd: pdfRow?.coverageEnd || excelRow?.coverageEnd || null,
+    inExcel: Boolean(excelRow),
+    inPdf: Boolean(pdfRow),
+  }
+}
+
+/**
+ * Match Excel↔PDF by SKU + serial/group when possible, else sequence within SKU.
+ * Zero qty+cost placeholders are excluded before matching.
+ */
 function buildComparedLines(excelData, pdfData) {
-  const pdfLines = flattenPdfLines(pdfData)
-  const excelBySku = new Map()
-  for (const row of excelData.lineItems || []) {
-    const sku = normalizeSku(row.sku)
-    if (!sku) continue
-    if (!excelBySku.has(sku)) excelBySku.set(sku, [])
-    excelBySku.get(sku).push(row)
+  const { excel: excelItems, pdf: pdfLines } = filterAuditLines(
+    excelData.lineItems,
+    flattenPdfLines(pdfData),
+  )
+
+  const excelUsed = new Set()
+  const pdfUsed = new Set()
+  const pairs = []
+
+  // Pass 1: compound key SKU + serial
+  for (let pi = 0; pi < pdfLines.length; pi++) {
+    const p = pdfLines[pi]
+    const pSku = normalizeSku(p.sku)
+    const pSerial = normalizeSerialKey(p.serialNumber)
+    if (!pSku || !pSerial) continue
+    for (let ei = 0; ei < excelItems.length; ei++) {
+      if (excelUsed.has(ei)) continue
+      const e = excelItems[ei]
+      if (normalizeSku(e.sku) !== pSku) continue
+      if (normalizeSerialKey(e.serialNumber) !== pSerial) continue
+      excelUsed.add(ei)
+      pdfUsed.add(pi)
+      pairs.push({ excel: e, pdf: p })
+      break
+    }
   }
 
+  // Pass 2: remaining rows with same SKU, paired in sequence order
+  const excelBySku = new Map()
   const pdfBySku = new Map()
-  for (const row of pdfLines) {
-    const sku = normalizeSku(row.sku)
+  for (let ei = 0; ei < excelItems.length; ei++) {
+    if (excelUsed.has(ei)) continue
+    const sku = normalizeSku(excelItems[ei].sku)
+    if (!sku) continue
+    if (!excelBySku.has(sku)) excelBySku.set(sku, [])
+    excelBySku.get(sku).push(ei)
+  }
+  for (let pi = 0; pi < pdfLines.length; pi++) {
+    if (pdfUsed.has(pi)) continue
+    const sku = normalizeSku(pdfLines[pi].sku)
     if (!sku) continue
     if (!pdfBySku.has(sku)) pdfBySku.set(sku, [])
-    pdfBySku.get(sku).push(row)
+    pdfBySku.get(sku).push(pi)
   }
 
   const skus = new Set([...excelBySku.keys(), ...pdfBySku.keys()])
-  const compared = []
-
   for (const sku of skus) {
-    const excelRows = excelBySku.get(sku) || []
-    const pdfRows = pdfBySku.get(sku) || []
-    const excelQty = excelRows.reduce((s, r) => s + (toNumber(r.qty) || 0), 0)
-    const pdfQty = pdfRows.reduce((s, r) => s + (toNumber(r.qty) || 0), 0)
-    const cost =
-      toNumber(excelRows[0]?.resellerUnitCost) ??
-      toNumber(excelRows[0]?.resellerPrice) ??
-      toNumber(excelRows[0]?.cost)
-    const sell =
-      toNumber(pdfRows[0]?.unitPrice) ?? toNumber(pdfRows[0]?.sell)
-    const margin = grossMarginPercent(sell, cost)
-    const markup = grossMarkupPercent(sell, cost)
-
-    compared.push({
-      sku,
-      description:
-        pdfRows[0]?.description || excelRows[0]?.description || '',
-      excelQty: excelRows.length ? excelQty : null,
-      pdfQty: pdfRows.length ? pdfQty : null,
-      qty: pdfRows.length ? pdfQty : excelQty,
-      resellerUnitCost: cost,
-      unitPrice: sell,
-      extendedPrice:
-        toNumber(pdfRows[0]?.extendedPrice) ??
-        (sell != null && pdfQty ? roundMoney(sell * pdfQty) : null),
-      margin,
-      markup,
-      marginRounded: roundPct(margin),
-      markupRounded: roundPct(markup),
-      page: pdfRows[0]?.page ?? null,
-      line: excelRows[0]?.line ?? null,
-      sheetName: excelRows[0]?.sheetName ?? excelData.sheetName ?? null,
-      excelRow: excelRows[0]?.excelRow ?? null,
-      excelCols: excelRows[0]?.excelCols ?? null,
-      excelSerial: excelRows[0]?.serialNumber ?? null,
-      pdfSerial: pdfRows[0]?.serialNumber ?? null,
-      coverageEnd: pdfRows[0]?.coverageEnd || excelRows[0]?.coverageEnd || null,
-      inExcel: excelRows.length > 0,
-      inPdf: pdfRows.length > 0,
-    })
+    const eIdxs = excelBySku.get(sku) || []
+    const pIdxs = pdfBySku.get(sku) || []
+    const n = Math.max(eIdxs.length, pIdxs.length)
+    for (let i = 0; i < n; i++) {
+      const ei = eIdxs[i]
+      const pi = pIdxs[i]
+      if (ei != null) excelUsed.add(ei)
+      if (pi != null) pdfUsed.add(pi)
+      pairs.push({
+        excel: ei != null ? excelItems[ei] : null,
+        pdf: pi != null ? pdfLines[pi] : null,
+      })
+    }
   }
 
-  // Mean / σ from clean lines only (exclude 0% / negative margin errors)
+  const compared = pairs.map(({ excel, pdf }) =>
+    pairToComparedRow(excel, pdf, excelData),
+  )
+
+  const excelSkuSet = new Set(
+    excelItems.map((r) => normalizeSku(r.sku)).filter(Boolean),
+  )
+  const pdfSkuSet = new Set(
+    pdfLines.map((r) => normalizeSku(r.sku)).filter(Boolean),
+  )
+  let matchedSkuCount = 0
+  for (const s of pdfSkuSet) {
+    if (excelSkuSet.has(s)) matchedSkuCount += 1
+  }
+  const skuOverlapPercent =
+    pdfSkuSet.size > 0
+      ? Math.round((matchedSkuCount / pdfSkuSet.size) * 10000) / 100
+      : null
+
   const cleanMargins = compared
     .filter((r) => r.inExcel && r.inPdf && r.margin != null && r.margin > 0)
     .map((r) => r.margin)
@@ -324,7 +415,6 @@ function buildComparedLines(excelData, pdfData) {
       return {
         ...r,
         zScore: z != null ? roundPct(z) : null,
-        // Mild: >2σ; extreme: >3σ
         isOutlier: z != null && z > 2,
         isExtremeOutlier: z != null && z > 3,
       }
@@ -333,6 +423,10 @@ function buildComparedLines(excelData, pdfData) {
     stdDevMargin: σ,
     meanMarginRounded: roundPct(μ),
     stdDevMarginRounded: roundPct(σ),
+    skuOverlapPercent,
+    matchedSkuCount,
+    pdfSkuCount: pdfSkuSet.size,
+    excelSkuCount: excelSkuSet.size,
   }
 }
 
@@ -509,13 +603,70 @@ function dateSearchTerms(iso) {
   ]
 }
 
+function emptyAnalysis(extra = {}) {
+  return {
+    lines: [],
+    meanMargin: null,
+    stdDevMargin: null,
+    meanMarginRounded: null,
+    stdDevMarginRounded: null,
+    skuOverlapPercent: 0,
+    matchedSkuCount: 0,
+    pdfSkuCount: 0,
+    excelSkuCount: 0,
+    ...extra,
+  }
+}
+
 /**
  * Pre-flight audit: excelData + pdfData → ranked errors + verdict + compared lines.
  */
 export function auditQuote(excelData, pdfData, { asOfDate = todayYmd() } = {}) {
   const errors = []
   const analysis = buildComparedLines(excelData, pdfData)
-  const { lines, meanMargin } = analysis
+  const { lines, meanMargin, skuOverlapPercent, matchedSkuCount, pdfSkuCount } =
+    analysis
+
+  // Currency mismatch (do not compare customer vs distributor names)
+  const excelCurrency = excelData?.currency || null
+  const pdfCurrency = pdfData?.currency || null
+  if (
+    excelCurrency &&
+    pdfCurrency &&
+    String(excelCurrency).toUpperCase() !== String(pdfCurrency).toUpperCase()
+  ) {
+    errors.push(
+      makeError({
+        type: 'CURRENCY_MISMATCH',
+        severity: 'WARNING',
+        page: 1,
+        message: `Currency Mismatch Detected: Distributor quote uses ${excelCurrency} while SNAP PDF uses ${pdfCurrency}. Exchange rate validation required.`,
+      }),
+    )
+  }
+
+  // Project mismatch: 0% of PDF SKUs appear in Excel — halt line audits
+  if (pdfSkuCount > 0 && matchedSkuCount === 0) {
+    errors.push(
+      makeError({
+        type: 'PROJECT_MISMATCH',
+        severity: 'CRITICAL',
+        page: 1,
+        message:
+          'Project Mismatch: These two files share 0 matching SKUs. They look unrelated — please verify you uploaded the correct distributor quote for this SNAP PDF.',
+      }),
+    )
+    return finalizeAuditResult(errors, {
+      ...emptyAnalysis({
+        skuOverlapPercent: skuOverlapPercent ?? 0,
+        matchedSkuCount,
+        pdfSkuCount,
+        excelSkuCount: analysis.excelSkuCount,
+      }),
+      halted: true,
+      haltReason: 'PROJECT_MISMATCH',
+    })
+  }
 
   // --- CRITICAL ---
   for (const row of lines) {
@@ -915,13 +1066,27 @@ export function auditQuote(excelData, pdfData, { asOfDate = todayYmd() } = {}) {
     }
   }
 
-  errors.sort((a, b) => {
+  return finalizeAuditResult(errors, {
+    lines: analysis.lines,
+    meanMargin: analysis.meanMargin,
+    stdDevMargin: analysis.stdDevMargin,
+    meanMarginRounded: analysis.meanMarginRounded,
+    stdDevMarginRounded: analysis.stdDevMarginRounded,
+    skuOverlapPercent: analysis.skuOverlapPercent,
+    matchedSkuCount: analysis.matchedSkuCount,
+    pdfSkuCount: analysis.pdfSkuCount,
+    excelSkuCount: analysis.excelSkuCount,
+  })
+}
+
+function finalizeAuditResult(errors, analysis) {
+  const sorted = [...errors].sort((a, b) => {
     const sr = SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]
     if (sr !== 0) return sr
     return String(a.sku || '').localeCompare(String(b.sku || ''))
   })
 
-  const ranked = errors.map((e, i) => ({
+  const ranked = sorted.map((e, i) => ({
     ...e,
     id: i + 1,
     hidden: false,
@@ -941,13 +1106,7 @@ export function auditQuote(excelData, pdfData, { asOfDate = todayYmd() } = {}) {
   return {
     errors: ranked,
     verdict,
-    analysis: {
-      lines: analysis.lines,
-      meanMargin: analysis.meanMargin,
-      stdDevMargin: analysis.stdDevMargin,
-      meanMarginRounded: analysis.meanMarginRounded,
-      stdDevMarginRounded: analysis.stdDevMarginRounded,
-    },
+    analysis,
     summaryCounts: {
       critical: criticalCount,
       warning: warningCount,
@@ -955,6 +1114,25 @@ export function auditQuote(excelData, pdfData, { asOfDate = todayYmd() } = {}) {
       total: visible.length,
     },
   }
+}
+
+/** Blocked check (unrecognized PDF, etc.) — surfaces as CRITICAL, not a thrown 500. */
+export function buildBlockedCheckResult({ type, message }) {
+  return finalizeAuditResult(
+    [
+      makeError({
+        type,
+        severity: 'CRITICAL',
+        page: 1,
+        message,
+      }),
+    ],
+    {
+      ...emptyAnalysis(),
+      halted: true,
+      haltReason: type,
+    },
+  )
 }
 
 /** Interactive target-margin correction for a line */

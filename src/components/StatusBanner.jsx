@@ -16,12 +16,13 @@ export default function StatusBanner({ errors = [] }) {
             Unsafe to send
           </div>
           <div className="text-xs text-white/90 mt-0.5">
-            {critical.length} critical issue{critical.length !== 1 ? 's' : ''}:{' '}
-            {critical
-              .slice(0, 3)
-              .map((e) => e.sku || e.type || 'issue')
-              .join(' · ')}
-            {critical.length > 3 ? '…' : ''}
+            {critical.length === 1 && !critical[0].sku
+              ? String(critical[0].message || '')
+                  .replace(/^(CRITICAL|WARNING|NOTICE):\s*/i, '')
+              : `${critical.length} critical issue${critical.length !== 1 ? 's' : ''}: ${critical
+                  .slice(0, 3)
+                  .map((e) => e.sku || e.type || 'issue')
+                  .join(' · ')}${critical.length > 3 ? '…' : ''}`}
           </div>
         </div>
       </div>
