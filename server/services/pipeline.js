@@ -1,19 +1,15 @@
 import { extractPdfText } from './pdf.js'
 import { parseDistributorExcel } from '../../src/utils/excelParser.js'
 import { EMPTY_PDF_QUOTE } from '../../src/utils/pdfSchema.js'
-import {
-  auditQuote,
-  formatMoney,
-  toNumber,
-} from '../../src/utils/auditEngine.js'
+import { auditQuote, toNumber } from '../../src/utils/auditEngine.js'
 import {
   CUSTOMER_QUOTE,
   DISTRIBUTOR_QUOTE,
-  skuLabel,
 } from '../../src/constants/labels.js'
 import {
   extractPdfSchema,
   streamChatWithSonnet,
+  streamInitialAnalysisWithSonnet,
   streamQuickActionWithHaiku,
 } from './claude.js'
 
@@ -24,8 +20,8 @@ export function getSession(sessionId) {
 }
 
 /**
- * Fast check pipeline with progress callbacks.
- * Check summary is deterministic (no LLM narration).
+ * Check pipeline with progress callbacks.
+ * Audit math is deterministic; opening analysis is Sonnet-written.
  * PDF schema: Haiku primary → Sonnet fallback → regex.
  */
 export async function runQuoteCheck({
@@ -105,8 +101,10 @@ export async function runQuoteCheck({
 
   emit('audit', 'Running deterministic checks…')
   const auditResult = auditQuote(excelData, pdfData)
-  const summary = fallbackSummary(auditResult)
-  emit('audit', `Found ${auditResult.summaryCounts.total} issue(s).`)
+  emit(
+    'audit',
+    `Found ${auditResult.summaryCounts.total} issue(s). Writing analysis…`,
+  )
 
   const sessionId = crypto.randomUUID()
   const session = {
@@ -121,6 +119,7 @@ export async function runQuoteCheck({
     verdict: auditResult.verdict,
     warnings,
     files: { excelFilename, pdfFilename },
+    chatHistory: [],
     meta: {
       excel: {
         supplierQuoteNumber: excelData.supplierQuoteNumber,
@@ -140,6 +139,29 @@ export async function runQuoteCheck({
     },
   }
   sessions.set(sessionId, session)
+
+  const quoteDossier = buildQuoteDossier(session)
+  let summary = ''
+  try {
+    for await (const token of streamInitialAnalysisWithSonnet({
+      auditResult,
+      quoteDossier,
+      meta: session.meta,
+      warnings,
+    })) {
+      summary += token
+      emit('summary', summary)
+    }
+  } catch (err) {
+    warnings.push(`Opening analysis failed: ${err.message || err}`)
+    summary =
+      `I finished the check (${auditResult.summaryCounts.total} finding(s), verdict ${auditResult.verdict}). ` +
+      `Ask me about any SKU or issue and I will walk through the dossier.`
+    emit('summary', summary)
+  }
+
+  session.chatHistory = [{ role: 'assistant', text: summary }]
+  session.warnings = warnings
 
   return {
     sessionId,
@@ -394,97 +416,3 @@ function pageForOffset(markdown, offset) {
   return Number(markers[markers.length - 1][1]) || 1
 }
 
-function shortIssueLine(error) {
-  let raw = String(error.message || '')
-    .replace(/^(CRITICAL|WARNING|NOTICE):\s*/i, '')
-    .trim()
-  if (error.sku) {
-    const label = skuLabel(error.sku)
-    if (
-      !raw.toLowerCase().includes(String(error.sku).toLowerCase()) &&
-      !raw.toLowerCase().includes('sku ')
-    ) {
-      raw = `${label}: ${raw}`
-    }
-  }
-  if (error.severity === 'NOTICE' && raw.length > 150) {
-    return `${raw.slice(0, 147)}…`
-  }
-  return raw
-}
-
-function fallbackSummary(auditResult) {
-  const { verdict, summaryCounts, errors = [] } = auditResult
-  const mean = auditResult.analysis?.meanMarginRounded
-  const lines = []
-
-  if (verdict === 'UNSAFE_TO_SEND') {
-    lines.push('Not safe to send yet.')
-  } else if (verdict === 'REQUIRES_APPROVAL') {
-    lines.push('Needs a quick manager look before send.')
-  } else {
-    lines.push('Looks clear to send.')
-  }
-
-  lines.push('')
-  lines.push(
-    `Compared the ${DISTRIBUTOR_QUOTE} with the ${CUSTOMER_QUOTE}.`,
-  )
-  if (mean != null) {
-    lines.push(`Typical margin on clean lines: ${mean}%.`)
-  }
-
-  lines.push('')
-  const total = summaryCounts.total || 0
-  if (total === 0) {
-    lines.push('No issues found.')
-  } else {
-    const bits = []
-    if (summaryCounts.critical) bits.push(`${summaryCounts.critical} critical`)
-    if (summaryCounts.warning) {
-      bits.push(
-        `${summaryCounts.warning} warning${summaryCounts.warning === 1 ? '' : 's'}`,
-      )
-    }
-    if (summaryCounts.notice) {
-      bits.push(
-        `${summaryCounts.notice} notice${summaryCounts.notice === 1 ? '' : 's'}`,
-      )
-    }
-    lines.push(`Found ${total} issue${total === 1 ? '' : 's'} (${bits.join(', ')}).`)
-
-    const critical = errors.filter((e) => !e.hidden && e.severity === 'CRITICAL')
-    const warnings = errors.filter((e) => !e.hidden && e.severity === 'WARNING')
-    const notices = errors.filter((e) => !e.hidden && e.severity === 'NOTICE')
-
-    if (critical.length) {
-      lines.push('')
-      lines.push('Critical:')
-      for (const e of critical.slice(0, 3)) {
-        lines.push(`  • ${shortIssueLine(e)}`)
-      }
-    }
-    if (warnings.length) {
-      lines.push('')
-      lines.push('Warnings:')
-      for (const e of warnings.slice(0, 2)) {
-        lines.push(`  • ${shortIssueLine(e)}`)
-      }
-    }
-    if (notices.length) {
-      lines.push('')
-      lines.push(
-        notices.length === 1
-          ? 'Also 1 lighter notice worth a glance.'
-          : `Also ${notices.length} lighter notices worth a glance.`,
-      )
-      for (const e of notices.slice(0, 1)) {
-        lines.push(`  • ${shortIssueLine(e)}`)
-      }
-    }
-  }
-
-  lines.push('')
-  lines.push('Click an issue or ask me anything.')
-  return lines.join('\n')
-}

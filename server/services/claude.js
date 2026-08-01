@@ -23,6 +23,9 @@ Naming & File Source Rules:
 - Always call the PDF file the "Dynamix Customer Quote (PDF)".
 - The Distributor Quote (Excel Source) is 100% correct and is the unalterable cost benchmark.
 - The Dynamix Customer Quote (PDF) is generated via Dynamix SNAP, where manual edits happen. Audit PDF sell prices and terms against Excel cost.
+- Audience: Dynamix sends the PDF to the end customer. PDF issues matter for the customer-facing quote, not for the distributor.
+- Do not say the distributor (or any distributor brand such as Rubrik) checks, flags, or rejects the PDF. The distributor is not affected by PDF billing-schedule or sell-price presentation errors.
+- If a PDF issue could cause friction, frame it as something the customer could notice or question, or that Dynamix should clean up in SNAP before send.
 
 Margin Policy & Error Logic:
 - Usual target gross margin: 8% to 12%.
@@ -35,6 +38,8 @@ Margin Policy & Error Logic:
 Phrasing & Grounding Rules:
 - Only give soft suggestions: say the sell price "probably should" be higher if they want a normal margin.
 - Never say a price "needs" to be raised or that the user "must" change anything.
+- Prefer soft modals: "should", "could", "might", "probably". Never "must", "will block", "will cause", or other certainty about outcomes.
+- Say issues "could cause" a rejection or delay, not that they "will" block or reject the order.
 - If an Excel value looks unusual, mention it lightly as worth a thorough check, not as a confirmed cause.
 - Never invent margin numbers or assume causes you cannot verify directly from the source files.`
 
@@ -64,10 +69,11 @@ function client() {
   return new Anthropic({ apiKey })
 }
 
-async function complete({ model, system, user, maxTokens = 1200 }) {
+async function complete({ model, system, user, maxTokens = 1200, temperature }) {
   const res = await client().messages.create({
     model,
     max_tokens: maxTokens,
+    ...(temperature != null ? { temperature } : {}),
     system,
     messages: [{ role: 'user', content: user }],
   })
@@ -78,10 +84,17 @@ async function complete({ model, system, user, maxTokens = 1200 }) {
   return { text, model, usage: res.usage }
 }
 
-async function* streamComplete({ model, system, user, maxTokens = 800 }) {
+async function* streamComplete({
+  model,
+  system,
+  user,
+  maxTokens = 800,
+  temperature,
+}) {
   const stream = client().messages.stream({
     model,
     max_tokens: maxTokens,
+    ...(temperature != null ? { temperature } : {}),
     system,
     messages: [{ role: 'user', content: user }],
   })
@@ -110,6 +123,7 @@ async function extractPdfSchemaWithModel(pdfText, model) {
   const { text, model: usedModel } = await complete({
     model,
     maxTokens: 2500,
+    temperature: 0,
     system: pdfExtractionSystemPrompt(),
     user: pdfExtractionUserPrompt(pdfText),
   })
@@ -152,13 +166,19 @@ export async function extractPdfSchema(pdfText) {
   }
 }
 
+const REASONING_STYLE = `Reason from the provided facts each time. Write in your own words.
+Do not reuse a fixed template, canned opener, or identical phrasing across answers.
+Stay accurate and grounded; vary only the wording and emphasis, not the numbers or findings.`
+
 /** Haiku — short pill answers (streamed). */
 export async function* streamQuickActionWithHaiku({ question, error, context }) {
   yield* streamComplete({
     model: HAIKU,
     maxTokens: 550,
+    temperature: 0.85,
     system: `${HUMAN_VOICE}
 ${VISIBILITY_RULES}
+${REASONING_STYLE}
 Answer quote-check questions briefly (about 3-6 sentences) using quoteDossier.
 Never invent numeric margins; only use numbers in the context.
 Do not suggest a corrected sell price unless the user explicitly asks for one.
@@ -250,8 +270,64 @@ export async function* streamChatWithSonnet({ messages, context, quoteDossier = 
   yield* streamComplete({
     model: SONNET,
     maxTokens: 900,
-    system: CHAT_SYSTEM,
+    temperature: 0.85,
+    system: `${CHAT_SYSTEM}
+${REASONING_STYLE}`,
     user: buildChatUserPayload({ messages, context, quoteDossier }),
+  })
+}
+
+/**
+ * Sonnet — initial post-check analysis (streamed).
+ * Facts come from deterministic audit; prose is model-written each run.
+ */
+export async function* streamInitialAnalysisWithSonnet({
+  auditResult,
+  quoteDossier,
+  meta,
+  warnings = [],
+}) {
+  const findings = (auditResult?.errors || [])
+    .filter((e) => !e.hidden)
+    .map((e) => ({
+      severity: e.severity,
+      type: e.type,
+      sku: e.sku,
+      page: e.page,
+      message: e.message,
+      locations: e.locations,
+      math: e.math,
+    }))
+
+  yield* streamComplete({
+    model: SONNET,
+    maxTokens: 1100,
+    temperature: 0.9,
+    system: `${HUMAN_VOICE}
+${VISIBILITY_RULES}
+${REASONING_STYLE}
+You just finished a deterministic quote check. Write the opening analysis for the sales user.
+Cover: send readiness (from verdict), the important findings (critical first, then warnings, then lighter notices), and invite them to click an issue or ask a question.
+Do not comment on healthy, correct, or on-target margins. Do not praise the overall pricing strategy or average margin on clean lines. Skip any "most lines look fine" style asides. Only discuss margins when a finding flags them as a problem.
+Ground every number and SKU in the provided audit findings / dossier. Never invent margins or issues.
+Do not paste a rigid outline with identical section headers every time; write naturally like a coworker briefing them.`,
+    user: `Deterministic audit result (source of truth for numbers and findings):
+${JSON.stringify(
+  {
+    verdict: auditResult?.verdict,
+    summaryCounts: auditResult?.summaryCounts,
+    findings,
+    meta,
+    warnings,
+  },
+  null,
+  2,
+)}
+
+Quote dossier (line-by-line context):
+${JSON.stringify(quoteDossier, null, 2)}
+
+Write the opening analysis now. Focus on problems only.`,
   })
 }
 

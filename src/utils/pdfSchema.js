@@ -18,7 +18,10 @@ export function pdfExtractionSystemPrompt() {
   return `You extract structured data from a digital customer sales quote PDF text dump.
 Return ONLY valid JSON matching the schema. Use YYYY-MM-DD for dates.
 Do NOT calculate margins, markups, or invent numbers not present in the text.
-If a field is missing, use null. Quantities and prices must be numbers.`
+If a field is missing, use null. Quantities and prices must be numbers.
+CRITICAL money rule: copy every dollar amount EXACTLY as printed, including billing schedule years and totals.
+Never round, never "fix" a 1¢ mismatch, never make a schedule sum to the section total if the PDF does not.
+If Year 2 is one cent off in the PDF, extract that wrong cent — the audit engine must see it.`
 }
 
 export function pdfExtractionUserPrompt(pdfText) {

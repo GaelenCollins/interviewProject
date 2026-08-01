@@ -35,6 +35,13 @@ export function roundMoney(value) {
   return Math.round(value * 100) / 100
 }
 
+/** Integer cents — use for exact money equality (catches 1¢ errors). */
+export function toCents(value) {
+  const n = toNumber(value)
+  if (n == null) return null
+  return Math.round(n * 100)
+}
+
 export function roundPct(value, digits = 2) {
   if (value == null || !Number.isFinite(value)) return null
   const f = 10 ** digits
@@ -65,22 +72,30 @@ export function correctedSellPrice(resellerCost, targetMarginPercent) {
   return roundMoney(cost / (1 - m / 100))
 }
 
-export function isValidExtension(unitPrice, quantity, extendedPrice, tol = 0.01) {
+/** Exact to the cent by default — a 1¢ miss is invalid. */
+export function isValidExtension(unitPrice, quantity, extendedPrice, tolCents = 0) {
   const u = toNumber(unitPrice)
   const q = toNumber(quantity)
-  const e = toNumber(extendedPrice)
-  if (u == null || q == null || e == null) return null
-  return Math.abs(u * q - e) < tol
+  const eCents = toCents(extendedPrice)
+  if (u == null || q == null || eCents == null) return null
+  const expectedCents = Math.round(u * q * 100)
+  return Math.abs(expectedCents - eCents) <= tolCents
 }
 
-export function isScheduleBalanced(annualPayments, sectionTotal, tol = 0.01) {
-  const total = toNumber(sectionTotal)
-  if (total == null) return null
-  const sum = (annualPayments || []).reduce((acc, p) => {
-    const amt = toNumber(typeof p === 'number' ? p : p?.amount)
-    return acc + (amt ?? 0)
-  }, 0)
-  return Math.abs(sum - total) < tol
+/** Exact to the cent by default — schedule sum must match section total. */
+export function isScheduleBalanced(annualPayments, sectionTotal, tolCents = 0) {
+  const totalCents = toCents(sectionTotal)
+  if (totalCents == null) return null
+  let sumCents = 0
+  let sawAmount = false
+  for (const p of annualPayments || []) {
+    const c = toCents(typeof p === 'number' ? p : p?.amount)
+    if (c == null) continue
+    sawAmount = true
+    sumCents += c
+  }
+  if (!sawAmount) return null
+  return Math.abs(sumCents - totalCents) <= tolCents
 }
 
 export function mean(values) {
@@ -343,36 +358,41 @@ function makeError({
   const isZeroMargin = /ZERO_OR_NEGATIVE_MARGIN/i.test(type)
   const isReducedMarginFloor = /MARGIN_BELOW_FLOOR/i.test(type)
 
+  // Natural short questions only — model reasons from system prompt + error context.
   const actions = [
     {
       label: 'What caused this?',
       kind: 'cause',
-      query: isZeroMargin
-        ? `What could have caused this? Lead with the ${DISTRIBUTOR_QUOTE} cost vs ${CUSTOMER_QUOTE} sell comparison. Treat a 0% margin as a critical pricing error on the SNAP PDF first. As a brief aside, note that customer preferences around margin rebalancing (for example CapEx vs OpEx) can also explain irregular margins if the user already knows about that. Soft suggestions only (probably should); never say it "needs" to be raised. (${type}${sku ? ` · ${skuLabel(sku)}` : ''})`
-        : isReducedMarginFloor
-          ? `What could have caused this? Lead with the ${DISTRIBUTOR_QUOTE} cost vs ${CUSTOMER_QUOTE} sell comparison. Treat a SNAP PDF entry issue as more likely, and keep customer preferences around margin rebalancing (for example CapEx vs OpEx) as a brief aside. Soft suggestions only (probably should); never say it "needs" to change. (${type}${sku ? ` · ${skuLabel(sku)}` : ''})`
-          : `What could have caused this? Lead with the ${DISTRIBUTOR_QUOTE} cost vs ${CUSTOMER_QUOTE} sell comparison. Treat Excel as the unalterable cost benchmark; the PDF is from SNAP where manual edits happen. Soft suggestions only; never say the user "needs" to change a price. (${type}${sku ? ` · ${skuLabel(sku)}` : ''})`,
+      query: sku
+        ? `What caused the issue on ${skuLabel(sku)}?`
+        : 'What caused this issue?',
     },
   ]
   if (!isMarginIssue) {
     actions.push({
       label: 'What needs to change?',
       kind: 'fix',
-      query: `What might need to change here? Describe the mismatch clearly. Soft suggestions only (probably should); do not invent a new sell price and do not say anything "needs" to be raised. (${type}${sku ? ` · ${skuLabel(sku)}` : ''})`,
+      query: sku
+        ? `What might need to change for ${skuLabel(sku)}?`
+        : 'What might need to change here?',
     })
   }
   if (isMarginIssue) {
     actions.unshift({
       label: 'See margin breakdown',
       kind: 'margins',
-      query: `Show me the margin breakdown${sku ? ` for ${skuLabel(sku)}` : ''}. Do not suggest a sell price.`,
+      query: sku
+        ? `Walk me through the margin breakdown for ${skuLabel(sku)}.`
+        : 'Walk me through the margin breakdown.',
     })
   }
   if (isZeroMargin || isReducedMarginFloor) {
     actions.push({
       label: 'Margin rebalancing?',
       kind: 'capex_opex',
-      query: `Could this irregular margin be intentional customer preference around margin rebalancing (for example CapEx vs OpEx)? Keep it a brief aside. ${CAPEX_OPEX_NOTE}`,
+      query: sku
+        ? `Could the margin on ${skuLabel(sku)} be intentional rebalancing for the customer?`
+        : 'Could this margin be intentional rebalancing for the customer?',
     })
   }
 
@@ -606,7 +626,13 @@ export function auditQuote(excelData, pdfData, { asOfDate = todayYmd() } = {}) {
     }
 
     const groupTotal = toNumber(group.groupTotal)
-    if (groupTotal != null && Math.abs(lineExtSum - groupTotal) >= 0.01) {
+    const lineExtCents = toCents(lineExtSum)
+    const groupTotalCents = toCents(groupTotal)
+    if (
+      groupTotalCents != null &&
+      lineExtCents != null &&
+      Math.abs(lineExtCents - groupTotalCents) >= 1
+    ) {
       errors.push(
         makeError({
           type: 'GROUP_TOTAL_MISMATCH',
@@ -621,30 +647,54 @@ export function auditQuote(excelData, pdfData, { asOfDate = todayYmd() } = {}) {
       )
     }
 
-    // Billing schedule balance
-    if (group.billingSchedule?.length && groupTotal != null) {
-      const balanced = isScheduleBalanced(group.billingSchedule, groupTotal, 0.01)
-      const sum = roundMoney(
-        group.billingSchedule.reduce((a, p) => a + (toNumber(p.amount) || 0), 0),
-      )
-      const delta = sum != null ? Math.abs(sum - groupTotal) : null
-      if (balanced === false && delta != null) {
-        if (delta > 0.05) {
-          errors.push(
-            makeError({
-              type: 'SCHEDULE_UNBALANCED',
-              severity: 'CRITICAL',
-              page: group.page ?? 1,
-              message: `Annual payment schedule for "${group.groupTitle || 'section'}" (${formatMoney(sum)}) does not balance to section total ${formatMoney(groupTotal)}.`,
-            }),
-          )
-        } else {
+    // Billing schedule must balance to the cent against group total (or line sum).
+    if (group.billingSchedule?.length) {
+      const balanceTarget =
+        groupTotal != null ? groupTotal : roundMoney(lineExtSum)
+      const balanced = isScheduleBalanced(group.billingSchedule, balanceTarget, 0)
+      const sumCents = (group.billingSchedule || []).reduce((a, p) => {
+        const c = toCents(typeof p === 'number' ? p : p?.amount)
+        return a + (c ?? 0)
+      }, 0)
+      const targetCents = toCents(balanceTarget)
+      const deltaCents =
+        targetCents != null ? Math.abs(sumCents - targetCents) : null
+      const sum = roundMoney(sumCents / 100)
+      if (balanced === false && deltaCents != null && deltaCents >= 1) {
+        const delta = roundMoney(deltaCents / 100)
+        const highlight = [
+          group.groupTitle,
+          ...priceSearchTerms(sum),
+          ...priceSearchTerms(balanceTarget),
+        ].filter(Boolean)
+        if (deltaCents <= 5) {
           errors.push(
             makeError({
               type: 'PENNY_SCHEDULE_UNBALANCE',
               severity: 'NOTICE',
               page: group.page ?? 1,
-              message: `Penny-rounding schedule unbalance (Δ ${formatMoney(delta)}) on "${group.groupTitle || 'section'}" (likely a final-year adjustment).`,
+              highlightTerms: highlight,
+              math: {
+                scheduleSum: sum,
+                sectionTotal: balanceTarget,
+                deltaCents,
+              },
+              message: `Billing schedule for "${group.groupTitle || 'section'}" is off by ${formatMoney(delta)} (schedule ${formatMoney(sum)} vs section ${formatMoney(balanceTarget)}). Even a 1¢ miss should be cleaned up on the ${CUSTOMER_QUOTE} before the customer sees it.`,
+            }),
+          )
+        } else {
+          errors.push(
+            makeError({
+              type: 'SCHEDULE_UNBALANCED',
+              severity: 'CRITICAL',
+              page: group.page ?? 1,
+              highlightTerms: highlight,
+              math: {
+                scheduleSum: sum,
+                sectionTotal: balanceTarget,
+                deltaCents,
+              },
+              message: `Annual payment schedule for "${group.groupTitle || 'section'}" (${formatMoney(sum)}) does not balance to section total ${formatMoney(balanceTarget)} (off by ${formatMoney(delta)}).`,
             }),
           )
         }
@@ -652,11 +702,18 @@ export function auditQuote(excelData, pdfData, { asOfDate = todayYmd() } = {}) {
     }
   }
 
-  const groupTotalSum = roundMoney(
-    (pdfData.groups || []).reduce((a, g) => a + (toNumber(g.groupTotal) || 0), 0),
-  )
+  const groupTotalSumCents = (pdfData.groups || []).reduce((a, g) => {
+    const c = toCents(g.groupTotal)
+    return a + (c ?? 0)
+  }, 0)
+  const groupTotalSum = roundMoney(groupTotalSumCents / 100)
   const grand = toNumber(pdfData.grandTotal)
-  if (grand != null && groupTotalSum != null && Math.abs(groupTotalSum - grand) >= 0.01) {
+  const grandCents = toCents(grand)
+  if (
+    grandCents != null &&
+    groupTotalSumCents > 0 &&
+    Math.abs(groupTotalSumCents - grandCents) >= 1
+  ) {
     errors.push(
       makeError({
         type: 'GRAND_TOTAL_MISMATCH',

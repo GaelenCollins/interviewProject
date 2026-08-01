@@ -80,8 +80,13 @@ export default function App() {
       const result = await runCheckStream({
         pdfFile: nextPdf,
         excelFile: nextExcel,
-        onProgress: ({ message }) => {
+        onProgress: ({ stage, message }) => {
           if (!message) return
+          if (stage === 'summary') {
+            setCheckStatus('Writing analysis…')
+            upsertStreamingAssistant(message, false)
+            return
+          }
           setCheckStatus(message)
           upsertStreamingAssistant(message, false)
         },
