@@ -31,9 +31,15 @@ export default defineConfig(({ mode }) => {
     },
     server: {
       host: '0.0.0.0',
-      port: parseInt(process.env.PORT || '8443'),
+      port: parseInt(process.env.VITE_PORT || '8443'),
       strictPort: true,
       watch: { ignored: ['**/.figma/**'] },
+      proxy: {
+        '/api': {
+          target: `http://localhost:${process.env.API_PORT || 8787}`,
+          changeOrigin: true,
+        },
+      },
     },
     preview: {
       host: '0.0.0.0',

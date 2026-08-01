@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Upload, FileSpreadsheet, FileText, X, AlertCircle } from 'lucide-react'
 
 function isPdf(file) {
@@ -32,29 +32,53 @@ function classifyFiles(fileList) {
   return { pdf, excel, skipped }
 }
 
-export default function FileUpload({ onFilesReady }) {
+export default function FileUpload({
+  onFilesReady,
+  isChecking = false,
+  checkError = '',
+}) {
   const inputRef = useRef(null)
+  const autoStartedKey = useRef('')
   const [dragging, setDragging] = useState(false)
   const [pdfFile, setPdfFile] = useState(null)
   const [excelFile, setExcelFile] = useState(null)
   const [error, setError] = useState('')
 
   const mergeSelection = (incoming) => {
-    const { pdf, excel, skipped } = classifyFiles(incoming)
+    const classified = classifyFiles(incoming)
     setError('')
 
-    if (pdf) setPdfFile(pdf)
-    if (excel) setExcelFile(excel)
+    const nextPdf = classified.pdf || pdfFile
+    const nextExcel = classified.excel || excelFile
 
-    if (!pdf && !excel) {
-      setError('Please select a PDF and an Excel file (.xlsx / .xls).')
-      return
+    if (classified.pdf) setPdfFile(classified.pdf)
+    if (classified.excel) setExcelFile(classified.excel)
+
+    if (!classified.pdf && !classified.excel) {
+      setError(
+        'Select a Dynamix Customer Quote (PDF) and a Distributor Quote (Excel Source) (.xlsx / .xls) together.',
+      )
+      return { pdf: nextPdf, excel: nextExcel }
     }
 
-    if (skipped.length > 0) {
-      setError(`Skipped unsupported file(s): ${skipped.join(', ')}`)
+    if (classified.skipped.length > 0) {
+      setError(`Skipped unsupported file(s): ${classified.skipped.join(', ')}`)
+    }
+
+    return {
+      pdf: classified.pdf || pdfFile,
+      excel: classified.excel || excelFile,
     }
   }
+
+  // Single-click / drop: when both types are present, auto-run the check
+  useEffect(() => {
+    if (!pdfFile || !excelFile || isChecking) return
+    const key = `${pdfFile.name}:${pdfFile.size}:${excelFile.name}:${excelFile.size}`
+    if (autoStartedKey.current === key) return
+    autoStartedKey.current = key
+    onFilesReady({ pdfFile, excelFile })
+  }, [pdfFile, excelFile, isChecking, onFilesReady])
 
   const openPicker = () => {
     inputRef.current?.click()
@@ -63,7 +87,6 @@ export default function FileUpload({ onFilesReady }) {
   const handleInputChange = (e) => {
     const files = Array.from(e.target.files || [])
     if (files.length) mergeSelection(files)
-    // Allow re-selecting the same files later
     e.target.value = ''
   }
 
@@ -74,16 +97,7 @@ export default function FileUpload({ onFilesReady }) {
     if (files.length) mergeSelection(files)
   }
 
-  const canStart = Boolean(pdfFile && excelFile)
-
-  const handleStart = () => {
-    if (!canStart) {
-      setError('Select both a customer PDF and a distributor Excel file to continue.')
-      openPicker()
-      return
-    }
-    onFilesReady({ pdfFile, excelFile })
-  }
+  const displayError = checkError || error
 
   return (
     <div className="flex-1 flex items-center justify-center bg-brand-main">
@@ -116,54 +130,52 @@ export default function FileUpload({ onFilesReady }) {
             </div>
           </div>
           <p className="font-semibold mb-1 text-white/90 text-base">
-            Upload files to get started!
+            Drop both quotes to check
           </p>
           <p className="text-xs mb-5 text-white/40">
-            Select a distributor Excel quote and a customer PDF quote
+            One selection — we auto-detect .xls/.xlsx vs .pdf and start the check
           </p>
           <button
             type="button"
-            className="px-8 py-2.5 rounded-lg font-semibold text-sm bg-brand-acc3 text-brand-main hover:opacity-90 active:scale-95 transition-all"
+            className="px-8 py-2.5 rounded-lg font-semibold text-sm bg-brand-acc3 text-brand-main hover:opacity-90 active:scale-95 transition-all disabled:opacity-50"
             onClick={openPicker}
+            disabled={isChecking}
           >
-            Select files
+            {isChecking ? 'Checking quotes…' : 'Select files'}
           </button>
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-left">
           <FileChip
             icon={<FileSpreadsheet className="w-4 h-4 text-brand-acc3" />}
-            label="Distributor Excel"
+            label="Distributor Quote (Excel Source)"
             file={excelFile}
             emptyHint=".xlsx / .xls"
-            onClear={() => setExcelFile(null)}
+            onClear={() => {
+              autoStartedKey.current = ''
+              setExcelFile(null)
+            }}
             onPick={openPicker}
           />
           <FileChip
             icon={<FileText className="w-4 h-4 text-brand-secondary" />}
-            label="Customer PDF"
+            label="Dynamix Customer Quote (PDF)"
             file={pdfFile}
             emptyHint=".pdf"
-            onClear={() => setPdfFile(null)}
+            onClear={() => {
+              autoStartedKey.current = ''
+              setPdfFile(null)
+            }}
             onPick={openPicker}
           />
         </div>
 
-        {error && (
+        {displayError && (
           <div className="flex items-start gap-2 text-left text-xs text-brand-acc2 bg-brand-acc2/10 border border-brand-acc2/30 rounded-lg px-3 py-2">
             <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-            <span>{error}</span>
+            <span>{displayError}</span>
           </div>
         )}
-
-        <button
-          type="button"
-          onClick={handleStart}
-          disabled={!canStart}
-          className="w-full sm:w-auto px-8 py-2.5 rounded-lg font-semibold text-sm bg-brand-secondary text-brand-main hover:opacity-90 active:scale-95 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
-        >
-          Run quote check
-        </button>
       </div>
     </div>
   )

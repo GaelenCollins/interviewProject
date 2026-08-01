@@ -1,39 +1,43 @@
 import { useEffect, useRef, useState } from 'react'
 import { Send } from 'lucide-react'
 
-function MessageBody({ text }) {
-  return text.split('\n').map((line, j) => {
-    if (line.startsWith('**') && line.endsWith('**')) {
-      return (
-        <div key={j} className="font-semibold mt-1">
-          {line.slice(2, -2)}
-        </div>
-      )
-    }
-    if (line.match(/^\d+\. /) || line.startsWith('• ')) {
-      return (
-        <div key={j} className="ml-2">
-          {line}
-        </div>
-      )
-    }
-    return line ? (
-      <div key={j}>{line}</div>
-    ) : (
-      <div key={j} className="h-1" />
-    )
-  })
+function MessageBody({ text, streaming = false }) {
+  return (
+    <div className="whitespace-pre-wrap break-words">
+      {String(text || '')
+        .split('\n')
+        .map((line, j) =>
+          line ? (
+            <div key={j} className="leading-relaxed">
+              {line}
+            </div>
+          ) : (
+            <div key={j} className="h-2" />
+          ),
+        )}
+      {streaming && (
+        <span className="inline-block w-1.5 h-3 ml-0.5 align-middle bg-brand-acc2 animate-pulse" />
+      )}
+    </div>
+  )
 }
 
-export default function AiAssistant({ messages, onSend }) {
+export default function AiAssistant({
+  messages,
+  onSend,
+  disabled = false,
+  isChecking = false,
+  statusLine = '',
+}) {
   const [input, setInput] = useState('')
   const bottomRef = useRef(null)
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+  }, [messages, statusLine])
 
   const handleSend = () => {
+    if (disabled) return
     const trimmed = input.trim()
     if (!trimmed) return
     onSend(trimmed)
@@ -44,11 +48,18 @@ export default function AiAssistant({ messages, onSend }) {
     <div className="flex flex-col h-full bg-white border-l border-slate-200">
       <div className="px-4 py-3 shrink-0 border-b border-slate-100">
         <div className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full font-semibold text-sm bg-brand-acc2 text-[#1a1a00]">
-          ✨ AI Assistant
+          AI Assistant
         </div>
         <div className="text-xs mt-1.5 text-slate-400">
-          Quote check mode · ask anything
+          {isChecking
+            ? statusLine || 'Working through your files…'
+            : 'Ask anything about this quote check'}
         </div>
+        {isChecking && (
+          <div className="mt-2 h-1 rounded-full bg-slate-100 overflow-hidden">
+            <div className="h-full w-1/3 bg-brand-acc2 animate-pulse rounded-full" />
+          </div>
+        )}
       </div>
 
       <div className="flex-1 overflow-y-auto px-3 py-3 space-y-3">
@@ -58,8 +69,8 @@ export default function AiAssistant({ messages, onSend }) {
             className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
           >
             {msg.role === 'assistant' && (
-              <div className="w-5 h-5 rounded-full shrink-0 flex items-center justify-center mr-1.5 mt-0.5 bg-brand-acc2 text-[10px]">
-                ✨
+              <div className="w-5 h-5 rounded-full shrink-0 flex items-center justify-center mr-1.5 mt-0.5 bg-brand-acc2 text-[10px] text-[#1a1a00] font-bold">
+                AI
               </div>
             )}
             <div
@@ -69,7 +80,7 @@ export default function AiAssistant({ messages, onSend }) {
                   : 'bg-slate-100 text-slate-800 rounded-bl-sm'
               }`}
             >
-              <MessageBody text={msg.text} />
+              <MessageBody text={msg.text} streaming={Boolean(msg.streaming)} />
             </div>
           </div>
         ))}
@@ -87,17 +98,25 @@ export default function AiAssistant({ messages, onSend }) {
                 handleSend()
               }
             }}
-            placeholder="Ask me a question if you need help..."
+            placeholder={
+              disabled
+                ? isChecking
+                  ? 'Check in progress…'
+                  : 'Thinking…'
+                : 'Ask me a question if you need help...'
+            }
             rows={2}
-            className="flex-1 text-xs resize-none outline-none bg-transparent leading-relaxed text-slate-800 min-h-10"
+            disabled={disabled}
+            className="flex-1 text-xs resize-none outline-none bg-transparent leading-relaxed text-slate-800 min-h-10 disabled:opacity-60"
           />
           <button
             type="button"
             onClick={handleSend}
-            className="shrink-0 inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-brand-acc3 text-brand-main hover:opacity-90 active:scale-95 transition-all"
+            disabled={disabled}
+            className="shrink-0 inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-brand-acc3 text-brand-main hover:opacity-90 active:scale-95 transition-all disabled:opacity-50"
           >
             <Send className="w-3.5 h-3.5" strokeWidth={2.2} />
-            Send ✓
+            Send
           </button>
         </div>
       </div>

@@ -23,10 +23,15 @@ yarn-error.log*
 *.swp
 *.swo
 
-# Env
+# Env / secrets
 .env
 .env.*
 !.env.example
+
+# Uploads / temp
+uploads/
+tmp/
+server/tmp/
 
 # TypeScript
 *.tsbuildinfo

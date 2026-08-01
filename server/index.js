@@ -1,0 +1,133 @@
+import 'dotenv/config'
+import express from 'express'
+import cors from 'cors'
+import multer from 'multer'
+import { runQuoteCheck, streamChat } from './services/pipeline.js'
+import { MODELS } from './services/claude.js'
+
+const app = express()
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 40 * 1024 * 1024 },
+})
+
+app.use(cors())
+app.use(express.json({ limit: '2mb' }))
+
+function writeSse(res, event, data) {
+  res.write(`event: ${event}\n`)
+  res.write(`data: ${JSON.stringify(data)}\n\n`)
+}
+
+app.get('/api/health', (_req, res) => {
+  res.json({
+    ok: true,
+    models: MODELS,
+    hasAnthropicKey: Boolean(process.env.ANTHROPIC_API_KEY),
+    pdfExtractor: 'pdfjs-dist',
+  })
+})
+
+app.post(
+  '/api/check',
+  upload.fields([
+    { name: 'pdf', maxCount: 1 },
+    { name: 'excel', maxCount: 1 },
+  ]),
+  async (req, res) => {
+    const wantsStream = String(req.query.stream || '') === '1' || req.headers.accept?.includes('text/event-stream')
+
+    try {
+      const pdf = req.files?.pdf?.[0]
+      const excel = req.files?.excel?.[0]
+      if (!pdf || !excel) {
+        return res.status(400).json({ error: 'Both pdf and excel files are required.' })
+      }
+
+      if (wantsStream) {
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+        res.setHeader('Cache-Control', 'no-cache, no-transform')
+        res.setHeader('Connection', 'keep-alive')
+        res.flushHeaders?.()
+
+        const result = await runQuoteCheck({
+          excelBuffer: excel.buffer,
+          excelFilename: excel.originalname,
+          pdfBuffer: pdf.buffer,
+          pdfFilename: pdf.originalname,
+          onProgress: (payload) => writeSse(res, 'progress', payload),
+        })
+
+        writeSse(res, 'result', result)
+        res.end()
+        return
+      }
+
+      const result = await runQuoteCheck({
+        excelBuffer: excel.buffer,
+        excelFilename: excel.originalname,
+        pdfBuffer: pdf.buffer,
+        pdfFilename: pdf.originalname,
+      })
+      res.json(result)
+    } catch (err) {
+      console.error('[api/check]', err)
+      if (wantsStream && !res.headersSent) {
+        res.status(500).json({ error: err.message || 'Quote check failed' })
+      } else if (wantsStream) {
+        writeSse(res, 'error', { error: err.message || 'Quote check failed' })
+        res.end()
+      } else {
+        res.status(500).json({ error: err.message || 'Quote check failed' })
+      }
+    }
+  },
+)
+
+app.post('/api/chat', async (req, res) => {
+  const wantsStream =
+    String(req.query.stream || '') === '1' ||
+    req.headers.accept?.includes('text/event-stream')
+
+  try {
+    const { sessionId, message, mode = 'chat', errorId = null } = req.body || {}
+    if (!sessionId || !message) {
+      return res.status(400).json({ error: 'sessionId and message are required.' })
+    }
+
+    if (!wantsStream) {
+      let answer = ''
+      for await (const token of streamChat({ sessionId, message, mode, errorId })) {
+        answer += token
+      }
+      return res.json({ answer, mode })
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+    res.setHeader('Cache-Control', 'no-cache, no-transform')
+    res.setHeader('Connection', 'keep-alive')
+    res.flushHeaders?.()
+
+    for await (const token of streamChat({ sessionId, message, mode, errorId })) {
+      writeSse(res, 'token', { text: token })
+    }
+    writeSse(res, 'done', {})
+    res.end()
+  } catch (err) {
+    console.error('[api/chat]', err)
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message || 'Chat failed' })
+    } else {
+      writeSse(res, 'error', { error: err.message || 'Chat failed' })
+      res.end()
+    }
+  }
+})
+
+const port = Number(process.env.API_PORT || process.env.PORT || 8787)
+app.listen(port, () => {
+  console.log(`[quote-checker-api] listening on http://localhost:${port}`)
+  console.log(`[quote-checker-api] Haiku=${MODELS.HAIKU} Sonnet=${MODELS.SONNET}`)
+  if (!process.env.ANTHROPIC_API_KEY) console.warn('[warn] ANTHROPIC_API_KEY missing')
+  console.log('[quote-checker-api] PDF extraction: pdfjs-dist (free, digital PDFs)')
+})

@@ -7,6 +7,7 @@ import {
   ZoomIn,
   ZoomOut,
 } from 'lucide-react'
+import { findHighlightRects } from '../utils/pdfHighlights'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
 
@@ -19,12 +20,29 @@ const MAX_ZOOM = 2.5
 const ZOOM_STEP = 0.1
 const SCROLLBAR_WIDTH = 12
 
+function severityFill(severity, active) {
+  if (severity === 'CRITICAL') {
+    return active ? 'rgba(198, 79, 30, 0.45)' : 'rgba(198, 79, 30, 0.28)'
+  }
+  if (severity === 'WARNING') {
+    return active ? 'rgba(242, 169, 15, 0.45)' : 'rgba(242, 169, 15, 0.28)'
+  }
+  return active ? 'rgba(100, 116, 139, 0.40)' : 'rgba(100, 116, 139, 0.22)'
+}
+
+function severityRing(severity) {
+  if (severity === 'CRITICAL') return 'rgba(198, 79, 30, 0.9)'
+  if (severity === 'WARNING') return 'rgba(242, 169, 15, 0.95)'
+  return 'rgba(100, 116, 139, 0.9)'
+}
+
 export default function PdfViewer({
   pdfFile,
   pdfUrl,
   activePage,
   onPageChange,
   activeErrorId,
+  errorFocusKey = 0,
   errors = [],
   zoom,
   onZoomChange,
@@ -33,9 +51,11 @@ export default function PdfViewer({
   const [numPages, setNumPages] = useState(null)
   const [loadError, setLoadError] = useState('')
   const [markerPercents, setMarkerPercents] = useState([])
+  const [pageHighlights, setPageHighlights] = useState({})
 
   const scrollRef = useRef(null)
   const pageRefs = useRef({})
+  const highlightAnchorRefs = useRef({})
   const suppressScrollSync = useRef(false)
 
   const totalPages = numPages || 1
@@ -48,7 +68,9 @@ export default function PdfViewer({
     setNumPages(null)
     setLoadError('')
     setMarkerPercents([])
+    setPageHighlights({})
     pageRefs.current = {}
+    highlightAnchorRefs.current = {}
   }, [pdfUrl])
 
   useEffect(() => {
@@ -56,6 +78,41 @@ export default function PdfViewer({
       onPageChange(numPages)
     }
   }, [numPages, activePage, onPageChange])
+
+  const measureHighlightsForPage = (pageNumber) => {
+    const el = pageRefs.current[pageNumber]
+    if (!el) return
+
+    const pageErrors = visibleErrors.filter((e) => e.page === pageNumber)
+    const next = []
+
+    for (const error of pageErrors) {
+      const terms = error.highlightTerms?.length
+        ? error.highlightTerms
+        : [error.sku].filter(Boolean)
+      const rects = findHighlightRects(el, terms)
+      if (!rects.length && error.sku) {
+        // Fallback: still mark near top of page via badge only
+        continue
+      }
+      for (const rect of rects) {
+        next.push({
+          errorId: error.id,
+          severity: error.severity,
+          ...rect,
+        })
+      }
+    }
+
+    setPageHighlights((prev) => ({ ...prev, [pageNumber]: next }))
+  }
+
+  const measureAllHighlights = () => {
+    if (!numPages) return
+    for (let p = 1; p <= numPages; p++) {
+      measureHighlightsForPage(p)
+    }
+  }
 
   const measureMarkers = () => {
     const root = scrollRef.current
@@ -67,7 +124,17 @@ export default function PdfViewer({
     const next = visibleErrors
       .filter((error) => error.page >= 1 && error.page <= numPages)
       .map((error) => {
+        const anchor = highlightAnchorRefs.current[error.id]
         const el = pageRefs.current[error.page]
+        if (anchor && root.contains(anchor)) {
+          const top = anchor.offsetTop + (el?.offsetTop || 0) + anchor.offsetHeight / 2
+          return {
+            id: error.id,
+            page: error.page,
+            severity: error.severity,
+            percent: Math.min(98, Math.max(1, (top / contentHeight) * 100)),
+          }
+        }
         if (!el) {
           return {
             id: error.id,
@@ -93,7 +160,10 @@ export default function PdfViewer({
     const root = scrollRef.current
     if (!root) return undefined
 
-    const onResize = () => measureMarkers()
+    const onResize = () => {
+      measureAllHighlights()
+      measureMarkers()
+    }
     window.addEventListener('resize', onResize)
     const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(onResize) : null
     ro?.observe(root)
@@ -103,7 +173,7 @@ export default function PdfViewer({
       ro?.disconnect()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [numPages, visibleErrors, zoom, pdfUrl])
+  }, [numPages, visibleErrors, zoom, pdfUrl, pageHighlights])
 
   const scrollToPage = (page, { smooth = true } = {}) => {
     const el = pageRefs.current[page]
@@ -118,25 +188,40 @@ export default function PdfViewer({
     }, smooth ? 400 : 50)
   }
 
-  const isPageInView = (page) => {
-    const el = pageRefs.current[page]
+  const scrollToError = (error) => {
+    if (!error) return
     const root = scrollRef.current
-    if (!el || !root) return false
-    const viewTop = root.scrollTop
-    const viewBottom = viewTop + root.clientHeight
-    const elTop = el.offsetTop
-    const elBottom = elTop + el.offsetHeight
-    return elTop < viewBottom - 80 && elBottom > viewTop + 80
+    const anchor = highlightAnchorRefs.current[error.id]
+    if (!root) return
+
+    suppressScrollSync.current = true
+    if (anchor) {
+      const rootRect = root.getBoundingClientRect()
+      const anchorRect = anchor.getBoundingClientRect()
+      const top =
+        root.scrollTop + (anchorRect.top - rootRect.top) - root.clientHeight * 0.3
+      root.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
+    } else {
+      scrollToPage(error.page)
+    }
+    window.setTimeout(() => {
+      suppressScrollSync.current = false
+    }, 450)
   }
 
+  // Only jump when the user explicitly picks an issue (errorFocusKey bumps).
+  // Do not re-pull them back after they scroll away, or when highlights remeasure.
+  const lastFocusKeyRef = useRef(0)
   useEffect(() => {
-    if (!numPages) return
-    // Jump only when the target page isn't already on screen (avoids fighting scroll)
-    if (!isPageInView(safePage)) {
-      scrollToPage(safePage)
-    }
+    if (!numPages || !errorFocusKey || activeErrorId == null) return
+    if (errorFocusKey === lastFocusKeyRef.current) return
+    lastFocusKeyRef.current = errorFocusKey
+    const error = errors.find((e) => e.id === activeErrorId && !e.hidden)
+    if (!error) return
+    const t = window.setTimeout(() => scrollToError(error), 80)
+    return () => window.clearTimeout(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePage, numPages])
+  }, [errorFocusKey, numPages])
 
   useEffect(() => {
     const root = scrollRef.current
@@ -180,19 +265,13 @@ export default function PdfViewer({
 
   return (
     <div className="flex flex-col h-full min-h-0 bg-brand-main overflow-hidden">
-      <div className="flex items-center justify-between px-4 py-2.5 shrink-0 bg-black/25 border-b border-white/10 gap-2">
-        <div className="flex items-center gap-2 shrink-0">
-          <div className="w-2.5 h-2.5 rounded-full bg-red-400/70" />
-          <div className="w-2.5 h-2.5 rounded-full bg-yellow-400/70" />
-          <div className="w-2.5 h-2.5 rounded-full bg-green-400/70" />
-        </div>
+      <div className="flex items-center px-4 py-2.5 shrink-0 bg-black/25 border-b border-white/10">
         <span
-          className="text-xs font-medium text-white/50 font-mono truncate px-2"
+          className="text-xs font-medium text-white/50 font-mono truncate"
           title={pdfFile?.name}
         >
           {pdfFile?.name || 'customer_quote.pdf'}
         </span>
-        <div className="w-12 shrink-0" />
       </div>
 
       <div className="relative flex-1 min-h-0">
@@ -233,6 +312,7 @@ export default function PdfViewer({
                   const pageErrors = visibleErrors.filter(
                     (e) => e.page === pageNumber,
                   )
+                  const highlights = pageHighlights[pageNumber] || []
                   return (
                     <div
                       key={pageNumber}
@@ -245,33 +325,74 @@ export default function PdfViewer({
                     >
                       {pageErrors.map((error, idx) => (
                         <button
-                          key={error.id}
+                          key={`badge-${error.id}`}
                           type="button"
                           onClick={() => onSelectError?.(error.id)}
-                          className={`absolute -left-2 z-10 w-6 h-6 rounded-full flex items-center justify-center text-white text-[11px] font-bold font-mono shadow-lg transition-transform ${
+                          className={`absolute -left-2 z-20 w-6 h-6 rounded-full flex items-center justify-center text-white text-[11px] font-bold font-mono shadow-lg transition-transform ${
                             error.severity === 'CRITICAL'
                               ? 'bg-brand-acc1'
-                              : 'bg-brand-acc2'
+                              : error.severity === 'WARNING'
+                                ? 'bg-brand-acc2'
+                                : 'bg-slate-500'
                           } ${
                             activeErrorId === error.id
                               ? 'scale-125 ring-[3px] ring-white/30'
                               : 'hover:scale-110'
                           }`}
                           style={{ top: `${12 + idx * 28}px` }}
-                          title={`${error.severity} error #${error.id}`}
+                          title={`${error.severity} #${error.id}${error.sku ? ` · ${error.sku}` : ''}`}
                         >
                           {error.id}
                         </button>
                       ))}
+
                       <Page
                         pageNumber={pageNumber}
                         scale={renderScale}
                         className="shadow-2xl rounded overflow-hidden bg-white"
                         renderTextLayer
                         renderAnnotationLayer
-                        onRenderSuccess={measureMarkers}
+                        onRenderSuccess={() => {
+                          // Text layer paints slightly after canvas
+                          window.requestAnimationFrame(() => {
+                            measureHighlightsForPage(pageNumber)
+                            measureMarkers()
+                          })
+                        }}
                       />
-                      <div className="absolute bottom-2 right-2 px-1.5 py-0.5 rounded bg-black/50 text-[10px] text-white/80 font-mono">
+
+                      {/* Exact text highlights on the page */}
+                      <div className="pointer-events-none absolute inset-0 z-10">
+                        {highlights.map((h, idx) => {
+                          const active = activeErrorId === h.errorId
+                          return (
+                            <button
+                              key={`${h.errorId}-${idx}`}
+                              type="button"
+                              ref={(el) => {
+                                if (idx === 0 && el) {
+                                  highlightAnchorRefs.current[h.errorId] = el
+                                }
+                              }}
+                              onClick={() => onSelectError?.(h.errorId)}
+                              className="pointer-events-auto absolute rounded-sm transition-all"
+                              style={{
+                                left: h.left - 2,
+                                top: h.top - 1,
+                                width: h.width + 4,
+                                height: h.height + 2,
+                                background: severityFill(h.severity, active),
+                                boxShadow: active
+                                  ? `0 0 0 2px ${severityRing(h.severity)}`
+                                  : `inset 0 -2px 0 ${severityRing(h.severity)}`,
+                              }}
+                              title={`Issue #${h.errorId}`}
+                            />
+                          )
+                        })}
+                      </div>
+
+                      <div className="absolute bottom-2 right-2 px-1.5 py-0.5 rounded bg-black/50 text-[10px] text-white/80 font-mono z-20">
                         {pageNumber}
                       </div>
                     </div>
@@ -282,29 +403,30 @@ export default function PdfViewer({
           )}
         </div>
 
-        {/* Error markers over the always-visible scrollbar track */}
         {markerPercents.length > 0 && (
           <div
-            className="pointer-events-none absolute top-0 bottom-0 z-20"
-            style={{ right: 0, width: SCROLLBAR_WIDTH }}
-            aria-hidden={false}
+            className="pointer-events-none absolute top-0 bottom-0 z-30"
+            style={{ right: SCROLLBAR_WIDTH, width: 16 }}
           >
             {markerPercents.map((marker) => (
               <button
                 key={marker.id}
                 type="button"
                 title={`${marker.severity} on page ${marker.page}`}
-                onClick={() => {
+                onClick={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
                   onSelectError?.(marker.id)
-                  onPageChange(marker.page)
                 }}
-                className={`pointer-events-auto absolute left-1/2 -translate-x-1/2 -translate-y-1/2 w-2.5 h-2.5 rounded-full border border-white/80 shadow-md transition-transform hover:scale-125 ${
+                className={`pointer-events-auto absolute left-1/2 -translate-x-1/2 -translate-y-1/2 w-3.5 h-3.5 rounded-full border-2 border-white shadow-md transition-transform hover:scale-125 cursor-pointer ${
                   marker.severity === 'CRITICAL'
                     ? 'bg-brand-acc1'
-                    : 'bg-brand-acc2'
+                    : marker.severity === 'WARNING'
+                      ? 'bg-brand-acc2'
+                      : 'bg-slate-500'
                 } ${
                   activeErrorId === marker.id
-                    ? 'scale-125 ring-2 ring-white/50'
+                    ? 'scale-125 ring-2 ring-white/60'
                     : ''
                 }`}
                 style={{ top: `${marker.percent}%` }}
