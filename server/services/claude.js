@@ -4,6 +4,10 @@ import {
   pdfExtractionUserPrompt,
   normalizePdfQuote,
 } from '../../src/utils/pdfSchema.js'
+import {
+  buildScheduleFixAnswer,
+  resolveScheduleFixOptions,
+} from '../../src/utils/auditEngine.js'
 
 const HAIKU = process.env.CLAUDE_HAIKU_MODEL || 'claude-haiku-4-5'
 const SONNET = process.env.CLAUDE_SONNET_MODEL || 'claude-sonnet-4-5'
@@ -43,6 +47,7 @@ Phrasing & Grounding Rules:
 - Prefer soft modals: "should", "could", "might", "probably". Never "must", "will block", "will cause", or other certainty about outcomes.
 - Say issues "could cause" a rejection or delay, not that they "will" block or reject the order.
 - For any math-related finding (margins, target sell, extensions, schedule totals, qty × price), point the user to the Calculator in the app header (calculator icon; tabs for scientific math, sale price, and margin %) to work the numbers. Do not invent detailed sell-price math yourself unless the deterministic context already has the figure.
+- For billing-schedule / cash-flow issues, when recommending a change, happily share the deterministic example customer payment breakdown (distributor % of total × customer sell total) from math.scheduleAlignmentSuggestion — period by period with dollars. That is encouraged, not restricted.
 - If an Excel value looks unusual, mention it lightly as worth a thorough check, not as a confirmed cause.
 - Never invent margin numbers or assume causes you cannot verify directly from the source files.`
 
@@ -66,6 +71,7 @@ If the user asks about a 0% or low margin, frame it as Dynamix making less money
 Keep customer preferences around margin rebalancing as a brief aside. Soft suggestions only ("probably should"), never "needs".
 Unusual Excel peer values are only a light "fishy, double-check" aside, not the cause.
 When asked about missing terms, SKUs, coverage dates, serials, schedules, or notes, answer from quoteDossier concretely.
+For billing-schedule / cash-flow questions (cause, fix, what might change, or how to rebalance): use math.scheduleFixOptions. Prefer a simple period swap of existing customer amounts when it clears the deficit (no recalculation). Also offer the percent-match rebuild (distributor % × customer total) with each period's dollars. Stay concrete; do not invent schedule math.
 Use deeper synthesis when helpful: connect lines across the Distributor Quote (Excel Source) and Dynamix Customer Quote (PDF), explain policy bands clearly, and ground every claim in the dossier.`
 
 function client() {
@@ -178,23 +184,100 @@ const REASONING_STYLE = `Reason from the provided facts each time. Write in your
 Do not reuse a fixed template, canned opener, or identical phrasing across answers.
 Stay accurate and grounded; vary only the wording and emphasis, not the numbers or findings.`
 
+function moneyLabel(n) {
+  if (n == null || !Number.isFinite(Number(n))) return 'n/a'
+  return `$${Number(n).toLocaleString('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`
+}
+
+/** Human-readable schedule fix options for the model (chat / cause paths). */
+function formatScheduleFixBrief(error) {
+  const fixes = resolveScheduleFixOptions(error)
+  const parts = []
+
+  const swaps = (fixes.swapOptions || []).filter((s) => s.clearsAllDeficits)
+  if (swaps.length) {
+    const swapLines = swaps.map((s, idx) => {
+      const a = s.swap?.a
+      const b = s.swap?.b
+      const nets = (s.resultingSchedule || [])
+        .map(
+          (p) =>
+            `${p.periodLabel} customer ${moneyLabel(p.customerBilling)} → net ${moneyLabel(p.netCashFlow)}`,
+        )
+        .join('; ')
+      return `Option ${idx + 1} (simple swap, clears all deficits): ${s.summary}
+  ${a?.periodLabel}: ${moneyLabel(a?.from)} → ${moneyLabel(a?.to)}; ${b?.periodLabel}: ${moneyLabel(b?.from)} → ${moneyLabel(b?.to)}
+  After swap: ${nets}`
+    })
+    parts.push(
+      `Easy fixes using existing customer amounts (no recalculation):\n${swapLines.join('\n')}`,
+    )
+  }
+
+  const percent = fixes.percentMatch
+  const percentPeriods = percent?.periods || []
+  if (percentPeriods.length) {
+    const total = moneyLabel(percent.customerTotal)
+    const lines = percentPeriods.map((p) => {
+      const pct =
+        p.distributorSharePercent != null
+          ? `${p.distributorSharePercent}%`
+          : 'n/a'
+      return `- ${p.periodLabel}: ${pct} × ${total} → ${moneyLabel(p.suggestedCustomerBilling)} (currently ${moneyLabel(p.currentCustomerBilling)})`
+    })
+    parts.push(
+      `Percent-match rebuild (distributor % × customer total ${total}):\n${lines.join('\n')}`,
+    )
+  }
+
+  if (!parts.length) return null
+  return parts.join('\n\n')
+}
+
+function isScheduleFixQuestion(question) {
+  return /what might need to change|what needs to change|recommend|rebalance|how (to|do i|should)|fix the (schedule|cash)|suggested (schedule|billing|payment)/i.test(
+    String(question || ''),
+  )
+}
+
 /** Haiku — short pill answers (streamed). */
 export async function* streamQuickActionWithHaiku({ question, error, context }) {
+  const isScheduleIssue = /PAYMENT_SCHEDULE|CASH.?FLOW|SCHEDULE/i.test(
+    error?.type || '',
+  )
+
+  // Schedule fix questions: stream the deterministic answer so numbers always show.
+  // Only fall through to the LLM when no viable swap/percent option exists.
+  if (isScheduleIssue && isScheduleFixQuestion(question)) {
+    const deterministic = buildScheduleFixAnswer(error)
+    if (deterministic) {
+      yield deterministic
+      return
+    }
+  }
+
+  const scheduleFixBrief = isScheduleIssue
+    ? formatScheduleFixBrief(error)
+    : null
+
   yield* streamComplete({
     model: HAIKU,
-    maxTokens: 550,
-    temperature: 0.85,
+    maxTokens: isScheduleIssue ? 950 : 550,
+    temperature: 0.7,
     system: `${HUMAN_VOICE}
 ${VISIBILITY_RULES}
 ${REASONING_STYLE}
-Answer quote-check questions briefly (about 3-6 sentences) using quoteDossier.
+Answer quote-check questions briefly using quoteDossier.
 Stay strictly on the Active issue below — do not pivot to a different finding unless the user asks.
 Never invent numeric margins; only use numbers in the context.
-Do not suggest a corrected sell price unless the user explicitly asks for one.
-When asked what caused a discrepancy: lead with Excel cost (benchmark) vs SNAP PDF sell.
+Do not invent a corrected line-item sell price for margin findings unless the user explicitly asks for one.
+For billing schedule / cash-flow: if Schedule fix options are present, you MUST quote those exact dollars (swap and/or percent-match). Never give vague "collect more upfront" advice without numbers.
+When asked what caused a margin discrepancy: lead with Excel cost (benchmark) vs SNAP PDF sell.
 For low or 0% margins: this hurts Dynamix profitability; do not say the customer cares about low margin. Treat it as a likely SNAP pricing slip first; margin rebalancing can be a brief aside.
 For high margins (near/over ceiling): that is what a customer could push back on.
-For payment-schedule / cash-flow findings: talk about the deficit periods and billed vs distributor-due amounts from the Active issue.
 For math-related issues, recommend the Calculator in the app header.
 Soft suggestions only ("probably should"); never "needs to be raised".
 Keep any unusual Excel peer-discount note to one short aside: fishy, worth checking, not the cause.
@@ -210,7 +293,10 @@ ${JSON.stringify(
     sku: error?.sku,
     message: error?.message,
     locations: error?.locations,
-    math: error?.math,
+    math: {
+      ...(error?.math || {}),
+      scheduleFixOptions: resolveScheduleFixOptions(error),
+    },
     scheduleComparison: error?.scheduleComparison || null,
     omittedTerms: error?.omittedTerms || null,
     excelHints: error?.excelHints || context?.excelHints || [],
@@ -220,6 +306,13 @@ ${JSON.stringify(
   2,
 )}
 
+${
+  scheduleFixBrief
+    ? `Schedule fix options (cite these exact figures if recommending a change):
+${scheduleFixBrief}
+`
+    : ''
+}
 Excel row for this SKU:
 ${JSON.stringify(context?.excelSource || error?.excelSource || null, null, 2)}
 
@@ -243,7 +336,16 @@ ${JSON.stringify(
 )}
 
 Math context:
-${JSON.stringify(context?.math || error?.math || {}, null, 2)}
+${JSON.stringify(
+  {
+    ...(context?.math || error?.math || {}),
+    scheduleFixOptions: isScheduleIssue
+      ? resolveScheduleFixOptions(error)
+      : error?.math?.scheduleFixOptions,
+  },
+  null,
+  2,
+)}
 
 Meta:
 ${JSON.stringify(context?.meta || {}, null, 2)}`,
@@ -258,6 +360,10 @@ function buildChatUserPayload({ messages, context, quoteDossier }) {
 
   const dossier = quoteDossier || context?.quoteDossier || null
   const activeErrors = (context?.errors || []).filter((e) => !e.hidden)
+  const scheduleFixBriefs = activeErrors
+    .filter((e) => /PAYMENT_SCHEDULE|CASH.?FLOW|SCHEDULE/i.test(e.type || ''))
+    .map((e) => formatScheduleFixBrief(e))
+    .filter(Boolean)
 
   return `High-level context:
 ${JSON.stringify(
@@ -271,6 +377,8 @@ ${JSON.stringify(
       type: e.type,
       sku: e.sku,
       message: e.message,
+      math: e.math || null,
+      scheduleComparison: e.scheduleComparison || null,
     })),
     meta: context?.meta,
   },
@@ -278,6 +386,13 @@ ${JSON.stringify(
   2,
 )}
 
+${
+  scheduleFixBriefs.length
+    ? `Schedule fix options (USE THESE for billing schedule / cash-flow recommendations — lead with a clearing swap when available, then percent-match):
+${scheduleFixBriefs.join('\n\n')}
+`
+    : ''
+}
 Quote dossier (full line-by-line Excel + PDF terms — use this; checkFindings are active only):
 ${JSON.stringify(dossier, null, 2)}
 
@@ -285,7 +400,8 @@ Conversation:
 ${history}
 
 Reply naturally as the assistant. Use the quote dossier; do not claim you lack line visibility.
-Do not discuss ignored issues. If the user asks for an email or summary of problems, only include active findings.`
+Do not discuss ignored issues. If the user asks for an email or summary of problems, only include active findings.
+For billing-schedule questions, use the Schedule fix options above with concrete dollars — prefer an easy period swap when it clears the deficit.`
 }
 
 /** Sonnet — free-form chat (streamed) for deeper reasoning and synthesis. */

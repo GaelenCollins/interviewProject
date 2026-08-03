@@ -1,4 +1,7 @@
-import { formatMoney } from '../utils/auditEngine'
+import {
+  buildScheduleFixOptions,
+  formatMoney,
+} from '../utils/auditEngine'
 
 function formatNetLabel(netCashFlow) {
   const n = Number(netCashFlow) || 0
@@ -31,7 +34,10 @@ function MoneyWithShare({ amount, sharePercent, emphasize = false }) {
   )
 }
 
-export default function PaymentScheduleBreakdown({ scheduleComparison = [] }) {
+export default function PaymentScheduleBreakdown({
+  scheduleComparison = [],
+  scheduleFixOptions = null,
+}) {
   const rows = Array.isArray(scheduleComparison) ? scheduleComparison : []
   if (!rows.length) return null
 
@@ -46,6 +52,18 @@ export default function PaymentScheduleBreakdown({ scheduleComparison = [] }) {
   const totalGrossProfit = cumulativeRevenue - cumulativeCost
   const problemRows = rows.filter((r) => r.hasDeficit || Number(r.netCashFlow) < -0.005)
   const rolledUpRows = rows.filter((r) => r.wasRolledUp && r.additionDetail)
+  // Recompute if the finding predates scheduleFixOptions attachment
+  const resolvedFixes =
+    scheduleFixOptions?.swapOptions?.length ||
+    scheduleFixOptions?.percentMatch?.periods?.length
+      ? scheduleFixOptions
+      : buildScheduleFixOptions(rows)
+  const swapOptions = (resolvedFixes?.swapOptions || []).filter(
+    (s) => s.clearsAllDeficits,
+  )
+  const percentPeriods =
+    resolvedFixes?.percentMatch?.periods ||
+    rows.filter((r) => r.suggestedCustomerBilling != null)
 
   return (
     <div
@@ -113,6 +131,74 @@ export default function PaymentScheduleBreakdown({ scheduleComparison = [] }) {
               )}
             </div>
           ))}
+        </div>
+      )}
+
+      {swapOptions.length > 0 && (
+        <div className="rounded-lg border border-emerald-200 bg-emerald-50/60 px-2.5 py-2 space-y-1.5">
+          <div className="text-[10px] font-semibold text-brand-main">
+            Easy fix: swap existing customer amounts
+          </div>
+          <div className="text-[10px] text-slate-600 leading-snug">
+            Move dollars between periods — no new math required.
+          </div>
+          {swapOptions.map((opt, idx) => (
+            <div
+              key={`swap-${idx}`}
+              className="text-[10px] text-slate-700 leading-snug space-y-0.5"
+            >
+              <div>
+                <span className="font-semibold">
+                  {opt.clearsAllDeficits ? 'Clears deficit: ' : 'Improves cash: '}
+                </span>
+                swap{' '}
+                <span className="font-medium">{opt.swap?.a?.periodLabel}</span>{' '}
+                ({formatMoney(opt.swap?.a?.from)} →{' '}
+                <span className="font-mono">{formatMoney(opt.swap?.a?.to)}</span>)
+                {' '}with{' '}
+                <span className="font-medium">{opt.swap?.b?.periodLabel}</span>{' '}
+                ({formatMoney(opt.swap?.b?.from)} →{' '}
+                <span className="font-mono">{formatMoney(opt.swap?.b?.to)}</span>)
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {percentPeriods.length > 0 && (
+        <div className="rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-2 space-y-1.5">
+          <div className="text-[10px] font-semibold text-brand-main">
+            Percent-match rebuild
+          </div>
+          <div className="text-[10px] text-slate-600 leading-snug">
+            Apply the distributor percent-of-total split to the customer total
+            {' '}({formatMoney(
+              resolvedFixes?.percentMatch?.customerTotal ?? cumulativeRevenue,
+            )}
+            ).
+          </div>
+          <ul className="text-[10px] text-slate-700 space-y-0.5 pl-3 list-disc">
+            {percentPeriods.map((row) => (
+              <li key={`sug-${row.periodLabel}`}>
+                <span className="font-medium">{row.periodLabel}</span>
+                {row.distributorSharePercent != null
+                  ? ` (${row.distributorSharePercent}%)`
+                  : ''}
+                :{' '}
+                <span className="font-mono">
+                  {formatMoney(row.suggestedCustomerBilling)}
+                </span>
+                {Number(row.currentCustomerBilling ?? row.customerBilling) !==
+                Number(row.suggestedCustomerBilling) ? (
+                  <span className="text-slate-400">
+                    {' '}
+                    (now{' '}
+                    {formatMoney(row.currentCustomerBilling ?? row.customerBilling)})
+                  </span>
+                ) : null}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
 

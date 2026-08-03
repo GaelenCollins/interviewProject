@@ -7,6 +7,7 @@ import {
 import {
   auditQuote,
   buildBlockedCheckResult,
+  resolveScheduleFixOptions,
   toNumber,
 } from '../../src/utils/auditEngine.js'
 import {
@@ -435,7 +436,8 @@ export async function* streamChat({
     const comparedLine =
       (session.analysis?.lines || []).find(
         (l) => String(l.sku || '').trim().toUpperCase() === skuKey,
-      ) || null
+      ) ||
+      null
 
     const healthyMargins = (session.analysis?.lines || [])
       .map((l) => l.margin)
@@ -445,12 +447,41 @@ export async function* streamChat({
         ? Math.round(Math.min(...healthyMargins) * 100) / 100
         : null
 
+    // Enrich schedule findings so fix options exist even for older sessions
+    let quickError = error
+    if (
+      error &&
+      /PAYMENT_SCHEDULE|CASH.?FLOW|SCHEDULE/i.test(error.type || '') &&
+      Array.isArray(error.scheduleComparison) &&
+      error.scheduleComparison.length
+    ) {
+      const scheduleFixOptions = resolveScheduleFixOptions(error)
+      quickError = {
+        ...error,
+        math: {
+          ...(error.math || {}),
+          scheduleFixOptions,
+          scheduleAlignmentSuggestion:
+            error.math?.scheduleAlignmentSuggestion ||
+            (scheduleFixOptions.percentMatch
+              ? {
+                  approach: scheduleFixOptions.percentMatch.summary,
+                  customerTotal: scheduleFixOptions.percentMatch.customerTotal,
+                  distributorTotal:
+                    scheduleFixOptions.percentMatch.distributorTotal,
+                  periods: scheduleFixOptions.percentMatch.periods,
+                }
+              : null),
+        },
+      }
+    }
+
     let full = ''
     for await (const token of streamQuickActionWithHaiku({
       question: message,
-      error,
+      error: quickError,
       context: {
-        math: error?.math || {
+        math: quickError?.math || {
           meanMarginPercent: session.analysis?.meanMarginRounded,
         },
         meta: session.meta,

@@ -167,11 +167,54 @@ function mergeRects(rects, gap = 2) {
   return out
 }
 
-/** PDF-user-space rects for term matches on one page (origin bottom-left). */
-async function findTermRectsOnPage(pdfJsPage, terms = []) {
-  const content = await pdfJsPage.getTextContent()
-  const items = (content.items || []).filter((it) => it?.str)
+function itemRectsForRange(map, start, length) {
+  const itemSet = new Set()
+  for (let i = start; i < start + length && i < map.length; i++) {
+    itemSet.add(map[i])
+  }
+  const rects = []
+  for (const item of itemSet) {
+    const t = item.transform || [1, 0, 0, 1, 0, 0]
+    const x = t[4]
+    const y = t[5]
+    const scaleX = Math.hypot(t[0], t[1]) || 1
+    const fontH = Math.hypot(t[2], t[3]) || 9
+    const w = Math.max((item.width || 0) * scaleX, length * fontH * 0.35)
+    const h = Math.max(fontH * 1.15, 8)
+    rects.push({
+      x,
+      y: y - fontH * 0.2,
+      width: w,
+      height: h,
+    })
+  }
+  return rects
+}
 
+function findPeriodLabelMatchesInHay(hay) {
+  const re = /(?:YEAR|YR\.?|PAYMENT|PERIOD|INSTALLMENT)\s*#?\s*([1-9]\d*)/gi
+  const out = []
+  let m
+  while ((m = re.exec(hay)) !== null) {
+    out.push({
+      start: m.index,
+      end: m.index + m[0].length,
+      text: m[0],
+      yearNum: String(m[1]),
+    })
+  }
+  return out
+}
+
+function normalizePeriodToken(text) {
+  const m = String(text || '').match(
+    /(?:YEAR|YR\.?|PAYMENT|PERIOD|INSTALLMENT)\s*#?\s*([1-9]\d*)/i,
+  )
+  return m ? m[1] : null
+}
+
+function buildTextMapFromPage(content) {
+  const items = (content.items || []).filter((it) => it?.str)
   let full = ''
   const map = []
   for (const item of items) {
@@ -181,6 +224,30 @@ async function findTermRectsOnPage(pdfJsPage, terms = []) {
       map.push(item)
     }
   }
+  return { full, map }
+}
+
+function unionPdfRect(boxes) {
+  if (!boxes?.length) return null
+  let x = Infinity
+  let y = Infinity
+  let right = -Infinity
+  let top = -Infinity
+  for (const b of boxes) {
+    x = Math.min(x, b.x)
+    y = Math.min(y, b.y)
+    right = Math.max(right, b.x + b.width)
+    top = Math.max(top, b.y + b.height)
+  }
+  if (!Number.isFinite(x)) return null
+  return { x, y, width: right - x, height: top - y }
+}
+
+/** PDF-user-space rects for term matches on one page (origin bottom-left). */
+async function findTermRectsOnPage(pdfJsPage, terms = []) {
+  const content = await pdfJsPage.getTextContent()
+  const { full, map } = buildTextMapFromPage(content)
+  if (!full) return []
 
   const hay = full.toUpperCase()
   const seen = new Set()
@@ -198,23 +265,109 @@ async function findTermRectsOnPage(pdfJsPage, terms = []) {
       const key = `${idx}:${needle}`
       if (!seen.has(key)) {
         seen.add(key)
-        const itemSet = new Set()
-        for (let i = idx; i < idx + needle.length && i < map.length; i++) {
-          itemSet.add(map[i])
-        }
-        for (const item of itemSet) {
-          const t = item.transform || [1, 0, 0, 1, 0, 0]
-          const x = t[4]
-          const y = t[5]
-          const scaleX = Math.hypot(t[0], t[1]) || 1
-          const fontH = Math.hypot(t[2], t[3]) || 9
-          const w = Math.max((item.width || 0) * scaleX, needle.length * fontH * 0.35)
-          const h = Math.max(fontH * 1.15, 8)
-          rects.push({
-            x,
-            y: y - fontH * 0.2,
-            width: w,
-            height: h,
+        rects.push(...itemRectsForRange(map, idx, needle.length))
+      }
+      from = idx + Math.max(1, needle.length)
+    }
+  }
+
+  return mergeRects(rects)
+}
+
+/**
+ * Highlight problem Year N labels + amounts whose nearest period label (by Y)
+ * is that problem year — equal $ on other years stay plain.
+ */
+async function findPairedScheduleRectsOnPage(pdfJsPage, pairs = []) {
+  const content = await pdfJsPage.getTextContent()
+  const { full, map } = buildTextMapFromPage(content)
+  if (!full || !pairs?.length) return []
+
+  const hay = full.toUpperCase()
+
+  const problemYearNums = new Set()
+  const labelTerms = new Set()
+  const expectedAmounts = new Set()
+  for (const pair of pairs) {
+    for (const y of pair.yearNums || []) {
+      if (y != null && String(y).trim()) problemYearNums.add(String(y))
+    }
+    for (const lab of pair.labels || []) {
+      const t = String(lab || '').trim()
+      if (t.length >= 2) labelTerms.add(t.toUpperCase())
+      const n = normalizePeriodToken(lab)
+      if (n) problemYearNums.add(n)
+    }
+    for (const a of pair.amounts || []) {
+      const t = String(a || '').trim().toUpperCase()
+      if (t.length >= 2) expectedAmounts.add(t)
+    }
+  }
+  for (const y of problemYearNums) {
+    labelTerms.add(`YEAR ${y}`)
+    labelTerms.add(`PAYMENT ${y}`)
+  }
+  if (!problemYearNums.size) return []
+
+  const labelByKey = new Map()
+  const remember = (yearNum, box) => {
+    if (!box) return
+    const cy = box.y + box.height / 2
+    const key = `${yearNum || '?'}:${Math.round(cy)}:${Math.round(box.x)}`
+    if (!labelByKey.has(key)) {
+      labelByKey.set(key, {
+        yearNum,
+        box,
+        cy,
+        right: box.x + box.width,
+      })
+    }
+  }
+
+  for (const lab of findPeriodLabelMatchesInHay(hay)) {
+    remember(
+      lab.yearNum,
+      unionPdfRect(itemRectsForRange(map, lab.start, lab.end - lab.start)),
+    )
+  }
+  for (const needle of labelTerms) {
+    let from = 0
+    while (from < hay.length) {
+      const idx = hay.indexOf(needle, from)
+      if (idx === -1) break
+      const matched = hay.slice(idx, idx + needle.length)
+      const yearNum =
+        normalizePeriodToken(matched) || normalizePeriodToken(needle)
+      remember(
+        yearNum,
+        unionPdfRect(itemRectsForRange(map, idx, needle.length)),
+      )
+      from = idx + Math.max(1, needle.length)
+    }
+  }
+
+  const allLabels = [...labelByKey.values()]
+  const problemLabels = allLabels.filter(
+    (l) => l.yearNum && problemYearNums.has(String(l.yearNum)),
+  )
+
+  const amountHits = []
+  const amountSeen = new Set()
+  const ordered = [...expectedAmounts].sort((a, b) => b.length - a.length)
+  for (const needle of ordered) {
+    let from = 0
+    while (from < hay.length) {
+      const idx = hay.indexOf(needle, from)
+      if (idx === -1) break
+      const key = `${idx}:${needle}`
+      if (!amountSeen.has(key)) {
+        amountSeen.add(key)
+        const box = unionPdfRect(itemRectsForRange(map, idx, needle.length))
+        if (box) {
+          amountHits.push({
+            box,
+            cy: box.y + box.height / 2,
+            left: box.x,
           })
         }
       }
@@ -222,7 +375,34 @@ async function findTermRectsOnPage(pdfJsPage, terms = []) {
     }
   }
 
-  return mergeRects(rects)
+  const out = []
+  for (const label of problemLabels) out.push({ ...label.box })
+
+  if (allLabels.length && amountHits.length) {
+    for (const amt of amountHits) {
+      let nearest = null
+      let best = Infinity
+      for (const lab of allLabels) {
+        const dy = Math.abs(amt.cy - lab.cy)
+        const score = dy + (amt.left >= lab.right - 8 ? 0 : 25)
+        if (score < best) {
+          best = score
+          nearest = lab
+        }
+      }
+      if (!nearest?.yearNum) continue
+      if (!problemYearNums.has(String(nearest.yearNum))) continue
+      if (Math.abs(amt.cy - nearest.cy) > 28) continue
+      out.push({ ...amt.box })
+    }
+  }
+
+  if (!out.length && problemYearNums.size) {
+    // Label-only fallback
+    return findTermRectsOnPage(pdfJsPage, [...labelTerms])
+  }
+
+  return mergeRects(out)
 }
 
 async function buildPageTermIndex(pdfBytes) {
@@ -251,6 +431,11 @@ async function buildPageTermIndex(pdfBytes) {
       if (!page) return []
       return findTermRectsOnPage(page, terms)
     },
+    async pairedRectsFor(pageNumber, pairs) {
+      const page = pages[pageNumber - 1]
+      if (!page) return []
+      return findPairedScheduleRectsOnPage(page, pairs)
+    },
     async destroy() {
       try {
         await pdf.destroy()
@@ -266,6 +451,58 @@ async function buildPageTermIndex(pdfBytes) {
  * @param {{ errors?: Array, verdict?: string }} auditResults
  * @returns {Promise<Uint8Array>}
  */
+function moneySearchTerms(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return []
+  const plain = n.toFixed(2)
+  const withComma = plain.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  return [plain, withComma, `$${withComma}`, `$${plain}`]
+}
+
+function resolveAnnotatorSchedulePairs(error) {
+  if (Array.isArray(error?.highlightPairs) && error.highlightPairs.length) {
+    return error.highlightPairs
+  }
+
+  const rows = Array.isArray(error?.scheduleComparison)
+    ? error.scheduleComparison
+    : []
+  const deficit =
+    rows.filter((p) => p.hasDeficit).length > 0
+      ? rows.filter((p) => p.hasDeficit)
+      : (error?.math?.deficitPeriods || []).map((label) => ({
+          periodLabel: label,
+        }))
+
+  const focus = deficit.length ? deficit : rows
+  const byYear = new Map()
+  for (const p of focus) {
+    const num = String(p.periodLabel || '').match(/\d+/)?.[0]
+    if (!num) continue
+    if (!byYear.has(num)) {
+      byYear.set(num, {
+        yearNums: [num],
+        labels: [`Year ${num}`, `Yr ${num}`, `Period ${num}`, `Payment ${num}`],
+        amounts: new Set(),
+      })
+    }
+    const entry = byYear.get(num)
+    if (p.periodLabel) entry.labels.push(String(p.periodLabel))
+    for (const t of moneySearchTerms(p.customerBilling ?? p.amount)) {
+      entry.amounts.add(t)
+    }
+    for (const c of p.contributions || []) {
+      for (const t of moneySearchTerms(c.amount)) entry.amounts.add(t)
+    }
+  }
+
+  return [...byYear.values()].map((p) => ({
+    yearNums: p.yearNums,
+    labels: [...new Set(p.labels)],
+    amounts: [...p.amounts],
+  }))
+}
+
 export async function generateAnnotatedPdf(pdfArrayBuffer, auditResults = {}) {
   const bytes =
     pdfArrayBuffer instanceof Uint8Array
@@ -362,11 +599,26 @@ export async function generateAnnotatedPdf(pdfArrayBuffer, auditResults = {}) {
 
     for (const error of pageErrors) {
       const isSchedule = /PAYMENT_SCHEDULE|CASH.?FLOW/i.test(error.type || '')
-      const terms = error.highlightTerms?.length
-        ? error.highlightTerms
-        : [error.sku].filter(Boolean)
-
-      const hlRects = await termIndex.rectsFor(pageNumber, terms)
+      let hlRects = []
+      if (isSchedule) {
+        const pairs = resolveAnnotatorSchedulePairs(error)
+        if (pairs.length) {
+          hlRects = await termIndex.pairedRectsFor(pageNumber, pairs)
+        } else {
+          // Labels only — never flat-search dollar amounts for schedule issues
+          const terms = (error.highlightTerms || []).filter(
+            (t) => !/[\$\d],?\d/.test(String(t)),
+          )
+          hlRects = terms.length
+            ? await termIndex.rectsFor(pageNumber, terms)
+            : []
+        }
+      } else {
+        const terms = error.highlightTerms?.length
+          ? error.highlightTerms
+          : [error.sku].filter(Boolean)
+        hlRects = await termIndex.rectsFor(pageNumber, terms)
+      }
       // Clamp highlights to content area only
       const clamped = hlRects
         .map((r) => ({

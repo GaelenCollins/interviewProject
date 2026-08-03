@@ -8,7 +8,10 @@ import {
   ZoomIn,
   ZoomOut,
 } from 'lucide-react'
-import { findHighlightRects } from '../utils/pdfHighlights'
+import {
+  findHighlightRects,
+  findPairedScheduleHighlightRects,
+} from '../utils/pdfHighlights'
 import {
   buildAnnotatedFilename,
   downloadBytes,
@@ -25,6 +28,61 @@ const BASE_SCALE = 1.4
 const MIN_ZOOM = 0.5
 const MAX_ZOOM = 2.5
 const ZOOM_STEP = 0.1
+
+function moneySearchTerms(value) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return []
+  const plain = n.toFixed(2)
+  const withComma = plain.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  return [plain, withComma, `$${withComma}`, `$${plain}`]
+}
+
+/** Build / normalize Year↔amount pairs for schedule PDF highlights. */
+function resolveScheduleHighlightPairs(error) {
+  if (Array.isArray(error?.highlightPairs) && error.highlightPairs.length) {
+    return error.highlightPairs
+  }
+
+  const rows = Array.isArray(error?.scheduleComparison)
+    ? error.scheduleComparison
+    : []
+  const deficit =
+    rows.filter((p) => p.hasDeficit).length > 0
+      ? rows.filter((p) => p.hasDeficit)
+      : (error?.math?.deficitPeriods || []).map((label) => ({
+          periodLabel: label,
+        }))
+
+  const focus = deficit.length
+    ? deficit
+    : rows.filter((p) => p.hasDeficit || p.periodCountMismatch)
+
+  const byYear = new Map()
+  for (const p of focus.length ? focus : rows) {
+    const num = String(p.periodLabel || '').match(/\d+/)?.[0]
+    if (!num) continue
+    if (!byYear.has(num)) {
+      byYear.set(num, {
+        yearNums: [num],
+        labels: [`Year ${num}`, `Yr ${num}`, `Period ${num}`, `Payment ${num}`],
+        amounts: new Set(),
+      })
+    }
+    const entry = byYear.get(num)
+    if (p.periodLabel) entry.labels.push(String(p.periodLabel))
+    const billing = p.customerBilling ?? p.amount
+    for (const t of moneySearchTerms(billing)) entry.amounts.add(t)
+    for (const c of p.contributions || []) {
+      for (const t of moneySearchTerms(c.amount)) entry.amounts.add(t)
+    }
+  }
+
+  return [...byYear.values()].map((p) => ({
+    yearNums: p.yearNums,
+    labels: [...new Set(p.labels)],
+    amounts: [...p.amounts],
+  }))
+}
 const SCROLLBAR_WIDTH = 12
 
 function severityFill(severity, active) {
@@ -100,11 +158,35 @@ export default function PdfViewer({
     const next = []
 
     for (const error of pageErrors) {
-      // Schedule issues: highlightTerms already scoped to problem years + payment amounts
-      const terms = error.highlightTerms?.length
-        ? error.highlightTerms
-        : [error.sku].filter(Boolean)
-      const rects = findHighlightRects(el, terms)
+      const isSchedule = /PAYMENT_SCHEDULE|CASH.?FLOW/i.test(error.type || '')
+      let rects = []
+      if (isSchedule) {
+        // Y-pair Year N ↔ payment so equal $ on other years stay plain.
+        const pairs = resolveScheduleHighlightPairs(error)
+        if (pairs.length) {
+          rects = findPairedScheduleHighlightRects(el, pairs)
+        }
+        if (!rects.length) {
+          // Last resort: problem-year labels only (never flat dollar search)
+          const labelTerms = [
+            ...(error.highlightTerms || []),
+            ...pairs.flatMap((p) => p.labels || []),
+            ...pairs.flatMap((p) =>
+              (p.yearNums || []).flatMap((y) => [
+                `Year ${y}`,
+                `Yr ${y}`,
+                `Payment ${y}`,
+              ]),
+            ),
+          ].filter((t) => t && !/[\$\d],?\d/.test(String(t)))
+          rects = findHighlightRects(el, [...new Set(labelTerms)])
+        }
+      } else {
+        const terms = error.highlightTerms?.length
+          ? error.highlightTerms
+          : [error.sku].filter(Boolean)
+        rects = findHighlightRects(el, terms)
+      }
       if (!rects.length && error.sku) {
         // Fallback: still mark near top of page via badge only
         continue
@@ -433,11 +515,14 @@ export default function PdfViewer({
                         renderTextLayer
                         renderAnnotationLayer
                         onRenderSuccess={() => {
-                          // Text layer paints slightly after canvas
-                          window.requestAnimationFrame(() => {
+                          // Text layer paints slightly after canvas — remeasure twice
+                          const run = () => {
                             measureHighlightsForPage(pageNumber)
                             measureMarkers()
-                          })
+                          }
+                          window.requestAnimationFrame(run)
+                          window.setTimeout(run, 80)
+                          window.setTimeout(run, 250)
                         }}
                       />
 

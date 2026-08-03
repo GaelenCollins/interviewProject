@@ -224,6 +224,7 @@ export default function ErrorCard({
           {showSchedule ? (
             <PaymentScheduleBreakdown
               scheduleComparison={error.scheduleComparison}
+              scheduleFixOptions={error.math?.scheduleFixOptions || null}
             />
           ) : null}
           {showOmitted ? (

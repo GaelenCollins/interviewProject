@@ -447,6 +447,7 @@ function makeError({
   omittedTerms = null,
   detailLines = null,
   pdfPages = null,
+  highlightPairs = null,
   excelHints = [],
   excelSource = null,
   discountContext = null,
@@ -456,6 +457,7 @@ function makeError({
     showMarginTable || /MARGIN|ZERO|NEGATIVE|FLOOR|CEILING|OUTLIER|TARGET_BAND/i.test(type)
   const isZeroMargin = /ZERO_OR_NEGATIVE_MARGIN/i.test(type)
   const isReducedMarginFloor = /MARGIN_BELOW_FLOOR/i.test(type)
+  const isScheduleIssue = /PAYMENT_SCHEDULE|CASH.?FLOW|SCHEDULE_MISMATCH/i.test(type)
 
   // Natural short questions — always name this finding so chat stays scoped.
   const issueFocus = [
@@ -477,7 +479,9 @@ function makeError({
     actions.push({
       label: 'What needs to change?',
       kind: 'fix',
-      query: `For this specific finding (${issueFocus}), what might need to change? Stay on this issue only.`,
+      query: isScheduleIssue
+        ? `For this specific finding (${issueFocus}), what might need to change? Use math.scheduleFixOptions: prefer any simple period swap that clears the deficit (no recalculation), then show the percent-match rebuild (distributor % × customer total) with dollar amounts per period. Stay concrete; stay on this issue only.`
+        : `For this specific finding (${issueFocus}), what might need to change? Stay on this issue only.`,
     })
   }
   if (isMarginIssue) {
@@ -524,6 +528,7 @@ function makeError({
     excelSource,
     discountContext,
     highlightTerms: terms,
+    highlightPairs: Array.isArray(highlightPairs) ? highlightPairs : null,
     math,
     showMarginTable,
     showScheduleTable:
@@ -639,10 +644,9 @@ function collectProblemYearPdfTargets(pdfData, focusPeriods = []) {
     amounts: [...p.amounts],
   }))
 
-  // Flat terms kept for fallbacks / non-paired callers (labels first; amounts still paired in UI)
-  const terms = [
-    ...new Set(pairs.flatMap((p) => [...p.labels, ...p.amounts])),
-  ]
+  // Labels only in flat terms — dollar amounts must go through highlightPairs
+  // so equal Year-2 payments are never globally matched.
+  const terms = [...new Set(pairs.flatMap((p) => p.labels))]
 
   return { terms, pairs, pages: pageList }
 }
@@ -837,6 +841,255 @@ export function comparePaymentSchedules(
     hasDeficit,
     periodCountMismatch,
   }
+}
+
+/**
+ * Concrete, quote-specific schedule fix ideas (no hardcoded years/amounts).
+ * - Simple customer-amount swaps between periods that clear or improve deficits
+ * - Percent-match: distributor share% × customer total sell
+ */
+export function buildScheduleFixOptions(scheduleRows = []) {
+  const rows = Array.isArray(scheduleRows) ? scheduleRows : []
+  if (rows.length < 2) {
+    return { swapOptions: [], percentMatch: null }
+  }
+
+  const periods = rows.map((r, index) => ({
+    index,
+    periodLabel: r.periodLabel || `Period ${index + 1}`,
+    distributorCost: toNumber(r.distributorCost) || 0,
+    customerBilling: toNumber(r.customerBilling) || 0,
+    distributorSharePercent: r.distributorSharePercent ?? null,
+  }))
+
+  const scoreBillings = (billings) => {
+    let deficitCount = 0
+    let deficitSum = 0
+    const nets = billings.map((b, i) => {
+      const net = roundMoney(b - periods[i].distributorCost) ?? 0
+      if (net < -0.05) {
+        deficitCount += 1
+        deficitSum += net
+      }
+      return net
+    })
+    return { deficitCount, deficitSum, nets }
+  }
+
+  const baseline = periods.map((p) => p.customerBilling)
+  const base = scoreBillings(baseline)
+  const swapOptions = []
+
+  for (let i = 0; i < periods.length; i++) {
+    for (let j = i + 1; j < periods.length; j++) {
+      if (Math.abs(baseline[i] - baseline[j]) < 0.009) continue
+      const trial = baseline.slice()
+      const tmp = trial[i]
+      trial[i] = trial[j]
+      trial[j] = tmp
+      const scored = scoreBillings(trial)
+      const clearsAll = scored.deficitCount === 0
+      const fewerDeficits = scored.deficitCount < base.deficitCount
+      const betterCash =
+        scored.deficitCount === base.deficitCount &&
+        scored.deficitSum > base.deficitSum + 0.05
+      if (!clearsAll && !fewerDeficits && !betterCash) continue
+
+      swapOptions.push({
+        kind: 'swap',
+        effort: 'low',
+        summary: `Swap the customer billing amounts between ${periods[i].periodLabel} and ${periods[j].periodLabel} (same dollars, different periods — no recalculation).`,
+        swap: {
+          a: {
+            periodLabel: periods[i].periodLabel,
+            from: roundMoney(baseline[i]),
+            to: roundMoney(trial[i]),
+          },
+          b: {
+            periodLabel: periods[j].periodLabel,
+            from: roundMoney(baseline[j]),
+            to: roundMoney(trial[j]),
+          },
+        },
+        resultingSchedule: periods.map((p, k) => ({
+          periodLabel: p.periodLabel,
+          distributorCost: roundMoney(p.distributorCost),
+          customerBilling: roundMoney(trial[k]),
+          netCashFlow: scored.nets[k],
+          hasDeficit: scored.nets[k] < -0.05,
+        })),
+        clearsAllDeficits: clearsAll,
+        remainingDeficitCount: scored.deficitCount,
+      })
+    }
+  }
+
+  swapOptions.sort((a, b) => {
+    if (a.clearsAllDeficits !== b.clearsAllDeficits) {
+      return a.clearsAllDeficits ? -1 : 1
+    }
+    if (a.remainingDeficitCount !== b.remainingDeficitCount) {
+      return a.remainingDeficitCount - b.remainingDeficitCount
+    }
+    return 0
+  })
+
+  // Prefer swaps that fully clear deficits; only fall back to "improves" if none clear.
+  const clearingSwaps = swapOptions.filter((s) => s.clearsAllDeficits)
+  const chosenSwaps = (
+    clearingSwaps.length ? clearingSwaps : swapOptions
+  ).slice(0, 3)
+
+  const totalCost = periods.reduce((a, p) => a + p.distributorCost, 0)
+  const totalBilling = periods.reduce((a, p) => a + p.customerBilling, 0)
+  let percentPeriods = periods.map((p) => {
+    const share =
+      totalCost > 0
+        ? (p.distributorCost || 0) / totalCost
+        : 0
+    const suggested =
+      totalBilling > 0 ? roundMoney(totalBilling * share) : null
+    return {
+      periodLabel: p.periodLabel,
+      distributorSharePercent:
+        p.distributorSharePercent ??
+        (totalCost > 0 ? roundPct(share * 100, 1) : null),
+      currentCustomerBilling: roundMoney(p.customerBilling),
+      suggestedCustomerBilling: suggested,
+    }
+  })
+  if (
+    totalBilling > 0 &&
+    percentPeriods.length &&
+    percentPeriods.every((p) => p.suggestedCustomerBilling != null)
+  ) {
+    const head = percentPeriods
+      .slice(0, -1)
+      .reduce((a, p) => a + (p.suggestedCustomerBilling || 0), 0)
+    percentPeriods[percentPeriods.length - 1].suggestedCustomerBilling =
+      roundMoney(totalBilling - head)
+  }
+
+  const percentMatch =
+    totalBilling > 0 && totalCost > 0
+      ? {
+          kind: 'percent_match',
+          effort: 'medium',
+          summary:
+            "Rebuild the customer billing schedule using the distributor's percent-of-total by period, applied to the total sold to Dynamix's customer.",
+          customerTotal: roundMoney(totalBilling),
+          distributorTotal: roundMoney(totalCost),
+          periods: percentPeriods,
+          resultingNets: percentPeriods.map((p, i) => {
+            const net =
+              roundMoney(
+                (p.suggestedCustomerBilling || 0) - periods[i].distributorCost,
+              ) ?? 0
+            return {
+              periodLabel: p.periodLabel,
+              netCashFlow: net,
+              hasDeficit: net < -0.05,
+            }
+          }),
+        }
+      : null
+
+  return {
+    swapOptions: chosenSwaps,
+    percentMatch,
+  }
+}
+
+/** Resolve fix options from error math or recompute from scheduleComparison. */
+export function resolveScheduleFixOptions(error) {
+  const existing = error?.math?.scheduleFixOptions
+  if (
+    existing &&
+    ((existing.swapOptions && existing.swapOptions.length) ||
+      existing.percentMatch?.periods?.length)
+  ) {
+    return existing
+  }
+  const rows = error?.scheduleComparison
+  if (Array.isArray(rows) && rows.length >= 2) {
+    return buildScheduleFixOptions(rows)
+  }
+  return { swapOptions: [], percentMatch: null }
+}
+
+/**
+ * Deterministic user-facing recommendation for schedule cash-flow issues.
+ * Returns null when no viable concrete option exists (caller may use LLM).
+ */
+export function buildScheduleFixAnswer(error) {
+  const fixes = resolveScheduleFixOptions(error)
+  const clearingSwaps = (fixes.swapOptions || []).filter(
+    (s) => s.clearsAllDeficits,
+  )
+  const percent = fixes.percentMatch
+  const percentClears =
+    percent?.resultingNets?.length > 0 &&
+    percent.resultingNets.every((n) => !n.hasDeficit)
+
+  if (!clearingSwaps.length && !percent?.periods?.length) return null
+
+  const parts = []
+  const deficitPeriods = error?.math?.deficitPeriods || []
+  const deficitLabel =
+    deficitPeriods.length > 0
+      ? deficitPeriods.join(', ')
+      : (error?.scheduleComparison || [])
+          .filter((p) => p.hasDeficit)
+          .map((p) => p.periodLabel)
+          .join(', ') || 'an early period'
+
+  parts.push(
+    `The cash-flow gap is timing: ${deficitLabel} does not collect enough from the customer to cover what Dynamix owes the distributor in that period.`,
+  )
+
+  if (clearingSwaps.length) {
+    const s = clearingSwaps[0]
+    const a = s.swap?.a
+    const b = s.swap?.b
+    parts.push(
+      `Easiest fix: swap the existing customer billing amounts between ${a?.periodLabel} and ${b?.periodLabel} — no recalculation. Put ${formatMoney(a?.to)} on ${a?.periodLabel} (currently ${formatMoney(a?.from)}) and ${formatMoney(b?.to)} on ${b?.periodLabel} (currently ${formatMoney(b?.from)}). That clears every period deficit while keeping the same customer total.`,
+    )
+    if (s.resultingSchedule?.length) {
+      const after = s.resultingSchedule
+        .map(
+          (p) =>
+            `${p.periodLabel}: customer ${formatMoney(p.customerBilling)} (net ${formatMoney(p.netCashFlow)})`,
+        )
+        .join('; ')
+      parts.push(`After that swap: ${after}.`)
+    }
+  }
+
+  if (percent?.periods?.length) {
+    const lead = clearingSwaps.length
+      ? 'Cleaner model-aligned alternative'
+      : 'Practical rebuild'
+    const lines = percent.periods
+      .map((p) => {
+        const pct =
+          p.distributorSharePercent != null
+            ? `${p.distributorSharePercent}%`
+            : null
+        return pct
+          ? `${p.periodLabel}: ${pct} of ${formatMoney(percent.customerTotal)} = ${formatMoney(p.suggestedCustomerBilling)} (currently ${formatMoney(p.currentCustomerBilling)})`
+          : `${p.periodLabel}: ${formatMoney(p.suggestedCustomerBilling)} (currently ${formatMoney(p.currentCustomerBilling)})`
+      })
+      .join('; ')
+    parts.push(
+      `${lead}: take each distributor period's share of total cost and multiply by the customer sell total (${formatMoney(percent.customerTotal)}). Suggested customer schedule: ${lines}.${percentClears ? ' That pattern also keeps every period cash-positive.' : ''}`,
+    )
+  }
+
+  parts.push(
+    'Soft suggestion only — use whichever option fits the deal, and the Calculator in the header if you want to sanity-check the arithmetic.',
+  )
+
+  return parts.join('\n\n')
 }
 
 const NOTE_COMPLIANCE_KEYWORDS =
@@ -1442,20 +1695,67 @@ export function auditQuote(
         (a, p) => a + (p.customerBilling || 0),
         0,
       )
-      // Attach share-of-total % onto each row for the breakdown UI
+      // Attach share-of-total % + suggested customer billings (match distributor %)
       const scheduleComparisonWithShare = comparison.scheduleComparison.map(
-        (p) => ({
-          ...p,
-          distributorSharePercent:
+        (p) => {
+          const distributorSharePercent =
             totalCost > 0
               ? roundPct(((p.distributorCost || 0) / totalCost) * 100, 1)
-              : null,
-          customerSharePercent:
-            totalBilling > 0
-              ? roundPct(((p.customerBilling || 0) / totalBilling) * 100, 1)
-              : null,
-        }),
+              : null
+          const suggestedCustomerBilling =
+            totalCost > 0 && totalBilling > 0
+              ? roundMoney(
+                  totalBilling * ((p.distributorCost || 0) / totalCost),
+                )
+              : null
+          return {
+            ...p,
+            distributorSharePercent,
+            customerSharePercent:
+              totalBilling > 0
+                ? roundPct(((p.customerBilling || 0) / totalBilling) * 100, 1)
+                : null,
+            suggestedCustomerBilling,
+            suggestedSharePercent: distributorSharePercent,
+          }
+        },
       )
+      // Penny-fix last period so suggested amounts sum exactly to customer total
+      if (
+        totalBilling > 0 &&
+        scheduleComparisonWithShare.length > 0 &&
+        scheduleComparisonWithShare.every(
+          (p) => p.suggestedCustomerBilling != null,
+        )
+      ) {
+        const headSum = scheduleComparisonWithShare
+          .slice(0, -1)
+          .reduce((a, p) => a + (p.suggestedCustomerBilling || 0), 0)
+        const last = scheduleComparisonWithShare[scheduleComparisonWithShare.length - 1]
+        last.suggestedCustomerBilling = roundMoney(totalBilling - headSum)
+      }
+      const scheduleFixOptions = buildScheduleFixOptions(
+        scheduleComparisonWithShare,
+      )
+      const scheduleAlignmentSuggestion = scheduleFixOptions.percentMatch
+        ? {
+            approach: scheduleFixOptions.percentMatch.summary,
+            customerTotal: scheduleFixOptions.percentMatch.customerTotal,
+            distributorTotal: scheduleFixOptions.percentMatch.distributorTotal,
+            periods: scheduleFixOptions.percentMatch.periods,
+          }
+        : {
+            approach:
+              "Match the distributor schedule's percent-of-total breakdown against the total sold to Dynamix's customer",
+            customerTotal: roundMoney(totalBilling),
+            distributorTotal: roundMoney(totalCost),
+            periods: scheduleComparisonWithShare.map((p) => ({
+              periodLabel: p.periodLabel,
+              distributorSharePercent: p.distributorSharePercent,
+              currentCustomerBilling: p.customerBilling,
+              suggestedCustomerBilling: p.suggestedCustomerBilling,
+            })),
+          }
       errors.push(
         makeError({
           type: 'PAYMENT_SCHEDULE_CASHFLOW',
@@ -1474,8 +1774,11 @@ export function auditQuote(
             rolledUpPeriods: rolledUp.map((p) => p.periodLabel),
             cumulativeDistributorCost: roundMoney(totalCost),
             cumulativeCustomerBilling: roundMoney(totalBilling),
+            scheduleAlignmentSuggestion,
+            scheduleFixOptions,
           },
           highlightTerms: pdfTargets.terms,
+          highlightPairs: pdfTargets.pairs,
           message:
             'Payment Schedule / Cash-Flow Discrepancy. The customer billing schedule does not align with the distributor payment terms. One or more periods create a negative net cash-flow position for Dynamix before profit is recovered in later installments. Click for breakdown.',
         }),
