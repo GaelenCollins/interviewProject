@@ -4,6 +4,7 @@ import FileUpload from './components/FileUpload'
 import Workspace from './components/Workspace'
 import AiAssistant from './components/AiAssistant'
 import MarginCalculatorModal from './components/MarginCalculatorModal'
+import ToolUsageDashboard from './components/ToolUsageDashboard'
 import { AI_RESPONSES } from './data/mockData'
 import { runCheckStream, sendChatStream, streamEmailDraft } from './api/client'
 import { computeVerdict } from './utils/auditEngine'
@@ -19,6 +20,7 @@ import {
 } from './utils/appIntents'
 
 export default function App() {
+  const [appTab, setAppTab] = useState('checker')
   const [hasUploadedFiles, setHasUploadedFiles] = useState(false)
   const [isChecking, setIsChecking] = useState(false)
   const [checkStatus, setCheckStatus] = useState('')
@@ -449,6 +451,10 @@ export default function App() {
         emailDisabled={!pdfFile || isChecking || emailExport?.phase === 'drafting' || emailExport?.phase === 'building'}
         showNewCheck={hasUploadedFiles}
         onNewCheck={handleNewCheck}
+        appTab={appTab}
+        onToggleAppTab={() =>
+          setAppTab((t) => (t === 'dashboard' ? 'checker' : 'dashboard'))
+        }
       />
 
       {emailExport ? (
@@ -493,7 +499,11 @@ export default function App() {
         </div>
       ) : null}
 
-      {hasUploadedFiles ? (
+      {appTab === 'dashboard' ? (
+        <div className="flex-1 min-h-0 overflow-hidden bg-slate-100">
+          <ToolUsageDashboard />
+        </div>
+      ) : hasUploadedFiles ? (
         <Workspace
           pdfFile={pdfFile}
           pdfUrl={pdfUrl}
