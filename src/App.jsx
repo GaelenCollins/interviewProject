@@ -13,6 +13,10 @@ import {
   generateDeterministicEmail,
   parseLlmEmailDraft,
 } from './utils/outlookDraftBuilder'
+import {
+  detectAppIntent,
+  messageForAppIntent,
+} from './utils/appIntents'
 
 export default function App() {
   const [hasUploadedFiles, setHasUploadedFiles] = useState(false)
@@ -38,6 +42,7 @@ export default function App() {
   const [zoom, setZoom] = useState(1)
   const [errorFocusKey, setErrorFocusKey] = useState(0)
   const [isChatBusy, setIsChatBusy] = useState(false)
+  const [exportRequestKey, setExportRequestKey] = useState(0)
 
   useEffect(() => {
     if (!pdfFile) {
@@ -245,6 +250,26 @@ export default function App() {
 
   const handleSendChat = (text) => {
     if (isChatBusy || isChecking) return
+
+    // Start in-app actions from chat (same as clicking header / toolbar controls).
+    const intent = detectAppIntent(text)
+    if (intent) {
+      const reply = messageForAppIntent(intent, { hasPdf: Boolean(pdfFile) })
+      setChatMessages((prev) => [
+        ...prev,
+        { role: 'user', text },
+        { role: 'assistant', text: reply },
+      ])
+      if (intent === 'email' && pdfFile) {
+        handleEmailDownload()
+      } else if (intent === 'calculator') {
+        setIsCalculatorOpen(true)
+      } else if (intent === 'annotated_pdf' && pdfFile) {
+        setExportRequestKey((k) => k + 1)
+      }
+      return
+    }
+
     askAssistant({ text, mode: 'chat' })
   }
 
@@ -491,6 +516,7 @@ export default function App() {
           chatDisabled={isChatBusy || isChecking}
           isChecking={isChecking}
           checkStatus={checkStatus}
+          exportRequestKey={exportRequestKey}
         />
       ) : (
         <div className="flex-1 flex overflow-hidden">

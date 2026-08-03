@@ -59,8 +59,18 @@ USE that data to answer. Never say you lack line-by-line term visibility or that
 If something is truly absent from quoteDossier, say exactly what field is missing — do not refuse the whole question.
 Ignored findings: checkFindings only lists active (non-ignored) issues. Never mention, summarize, or draft emails about ignored or hidden issues — even if they appeared earlier in the chat history or opening summary. Treat ignored issues as out of scope unless the user explicitly asks about a specific ignored item.`
 
+const APP_CAPABILITIES = `App capabilities (tell the user accurately how to use them — never invent missing features or deny real ones):
+- Email report with attachment: the header email button (and typing a request like "email this to my boss") downloads a .eml draft that includes an annotated PDF of active findings. The user opens that file in their email app, adds the recipient, and sends. The app does not transmit email itself.
+- Annotated PDF: PDF viewer toolbar "Export Annotated PDF" downloads a marked-up customer quote for the active findings.
+- Calculator: header calculator icon opens Sale Price / Margin % / scientific calculator tools.
+- Issues panel: click a finding to jump to PDF/Excel highlights; use Critical/Warning/Notice checkboxes to filter; Hide/Ignore removes an issue from the active list and from email drafts.
+- Quick actions on a finding card ("What caused this?", "What needs to change?") ask scoped questions about that issue.
+- Document toggle: switch Excel (Distributor Quote) vs PDF (Dynamix Customer Quote) in the viewer.
+If the user asks to email, open the calculator, or export an annotated PDF, the client may already start that action from their message — confirm briefly and explain the next step (e.g. open the downloaded .eml). Do not say the app cannot email or attach files.`
+
 const CHAT_SYSTEM = `${HUMAN_VOICE}
 ${VISIBILITY_RULES}
+${APP_CAPABILITIES}
 You are the Dynamix quote checker assistant.
 Be practical and specific to this quote pair.
 Never invent margin math. Prefer the provided deterministic figures.
@@ -197,7 +207,9 @@ function formatScheduleFixBrief(error) {
   const fixes = resolveScheduleFixOptions(error)
   const parts = []
 
-  const swaps = (fixes.swapOptions || []).filter((s) => s.clearsAllDeficits)
+  const allSwaps = fixes.swapOptions || []
+  const clearing = allSwaps.filter((s) => s.clearsAllDeficits)
+  const swaps = (clearing.length ? clearing : allSwaps).slice(0, 3)
   if (swaps.length) {
     const swapLines = swaps.map((s, idx) => {
       const a = s.swap?.a
@@ -208,12 +220,15 @@ function formatScheduleFixBrief(error) {
             `${p.periodLabel} customer ${moneyLabel(p.customerBilling)} → net ${moneyLabel(p.netCashFlow)}`,
         )
         .join('; ')
-      return `Option ${idx + 1} (simple swap, clears all deficits): ${s.summary}
+      const tag = s.clearsAllDeficits
+        ? 'clears all deficits'
+        : 'improves cash-flow'
+      return `Option ${idx + 1} (${s.kind === 'group_swap' ? 'within-group swap' : 'period swap'}, ${tag}): ${s.summary}
   ${a?.periodLabel}: ${moneyLabel(a?.from)} → ${moneyLabel(a?.to)}; ${b?.periodLabel}: ${moneyLabel(b?.from)} → ${moneyLabel(b?.to)}
   After swap: ${nets}`
     })
     parts.push(
-      `Easy fixes using existing customer amounts (no recalculation):\n${swapLines.join('\n')}`,
+      `Easy fixes using existing customer amounts (recommend BEFORE percent-match):\n${swapLines.join('\n')}`,
     )
   }
 
@@ -230,6 +245,24 @@ function formatScheduleFixBrief(error) {
     })
     parts.push(
       `Percent-match rebuild (distributor % × customer total ${total}):\n${lines.join('\n')}`,
+    )
+  }
+
+  const perGroup = fixes.perGroupEdits || []
+  if (perGroup.length) {
+    const groupLines = perGroup.map((g) => {
+      const pageBit = g.page != null ? ` (PDF p.${g.page})` : ''
+      const locked = moneyLabel(g.groupTotal ?? g.currentTotal)
+      const schedule = (g.periods || [])
+        .map(
+          (p) =>
+            `${p.periodLabel}: ${moneyLabel(p.currentAmount)} → ${moneyLabel(p.suggestedAmount)}`,
+        )
+        .join('; ')
+      return `- ${g.groupTitle}${pageBit}: edit Billing Schedule → ${schedule}; group total locked at ${locked}`
+    })
+    parts.push(
+      `Per-group Billing Schedule edits (distributor % within each locked group total):\n${groupLines.join('\n')}`,
     )
   }
 

@@ -1,6 +1,24 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Check, EyeOff, Star } from 'lucide-react'
 import ErrorCard from './ErrorCard'
+
+const SEVERITY_FILTERS = [
+  {
+    key: 'CRITICAL',
+    label: 'Critical',
+    accent: 'accent-brand-acc1 text-brand-acc1',
+  },
+  {
+    key: 'WARNING',
+    label: 'Warning',
+    accent: 'accent-[#d4a017] text-[#b07d00]',
+  },
+  {
+    key: 'NOTICE',
+    label: 'Notice',
+    accent: 'accent-slate-500 text-slate-600',
+  },
+]
 
 export default function ErrorFeed({
   errors,
@@ -13,14 +31,44 @@ export default function ErrorFeed({
   onUnignore,
 }) {
   const [tab, setTab] = useState('active')
+  const [severityOn, setSeverityOn] = useState({
+    CRITICAL: true,
+    WARNING: true,
+    NOTICE: true,
+  })
 
   const activeErrors = errors.filter((e) => !e.hidden)
   const ignoredErrors = errors.filter((e) => e.hidden)
-  const shown = tab === 'active' ? activeErrors : ignoredErrors
+
+  const severityCounts = useMemo(() => {
+    const counts = { CRITICAL: 0, WARNING: 0, NOTICE: 0 }
+    for (const e of activeErrors) {
+      const key = String(e.severity || '').toUpperCase()
+      if (counts[key] != null) counts[key] += 1
+    }
+    return counts
+  }, [activeErrors])
+
+  const shown = useMemo(() => {
+    const base = tab === 'active' ? activeErrors : ignoredErrors
+    if (tab !== 'active') return base
+    return base.filter((e) => severityOn[String(e.severity || '').toUpperCase()])
+  }, [tab, activeErrors, ignoredErrors, severityOn])
+
+  const toggleSeverity = (key) => {
+    setSeverityOn((prev) => {
+      const next = { ...prev, [key]: !prev[key] }
+      // Keep at least one severity visible so the list never goes blank by accident
+      if (!next.CRITICAL && !next.WARNING && !next.NOTICE) {
+        return prev
+      }
+      return next
+    })
+  }
 
   return (
     <div className="flex flex-col h-full bg-slate-100 border-r border-slate-200">
-      <div className="shrink-0 px-4 py-3 bg-white border-b border-slate-200">
+      <div className="shrink-0 px-4 py-3 bg-white border-b border-slate-200 space-y-2.5">
         <div className="flex items-center justify-between gap-2">
           <button
             type="button"
@@ -57,6 +105,48 @@ export default function ErrorFeed({
             )}
           </button>
         </div>
+
+        {tab === 'active' && activeErrors.length > 0 && (
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-[10px] font-medium text-slate-400">
+              Filter by severity
+            </span>
+            {SEVERITY_FILTERS.map((f) => {
+              const on = severityOn[f.key]
+              const count = severityCounts[f.key] || 0
+              const disabled = count === 0
+              return (
+                <label
+                  key={f.key}
+                  className={`inline-flex items-center gap-1.5 text-[11px] font-semibold select-none ${
+                    disabled
+                      ? 'opacity-35 cursor-not-allowed'
+                      : `cursor-pointer ${f.accent}`
+                  }`}
+                  title={
+                    disabled
+                      ? `No ${f.label.toLowerCase()} issues`
+                      : `${on ? 'Hide' : 'Show'} ${f.label.toLowerCase()} issues`
+                  }
+                >
+                  <input
+                    type="checkbox"
+                    className="w-3.5 h-3.5 rounded border-slate-300"
+                    checked={on && !disabled}
+                    disabled={disabled}
+                    onChange={() => toggleSeverity(f.key)}
+                  />
+                  <span>
+                    {f.label}
+                    <span className="ml-1 font-mono text-[10px] opacity-70">
+                      ({count})
+                    </span>
+                  </span>
+                </label>
+              )
+            })}
+          </div>
+        )}
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
@@ -68,12 +158,16 @@ export default function ErrorFeed({
               </div>
             </div>
             <div className="font-medium text-sm text-brand-main">
-              No active issues
+              {activeErrors.length === 0
+                ? 'No active issues'
+                : 'No issues match these filters'}
             </div>
             <div className="text-xs text-slate-400">
-              {ignoredErrors.length > 0
-                ? `${ignoredErrors.length} ignored — open Ignored Errors to restore`
-                : 'Upload files to run a check'}
+              {activeErrors.length === 0
+                ? ignoredErrors.length > 0
+                  ? `${ignoredErrors.length} ignored — open Ignored Errors to restore`
+                  : 'Upload files to run a check'
+                : 'Turn a severity filter back on to see matching cards'}
             </div>
           </div>
         )}

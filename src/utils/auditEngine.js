@@ -844,14 +844,17 @@ export function comparePaymentSchedules(
 }
 
 /**
- * Concrete, quote-specific schedule fix ideas (no hardcoded years/amounts).
- * - Simple customer-amount swaps between periods that clear or improve deficits
- * - Percent-match: distributor share% × customer total sell
+ * Concrete schedule fix ideas derived only from the current scheduleComparison.
+ * Never hardcodes years, pages, groups, or dollar amounts — every quote is
+ * scanned the same way:
+ * - Roll-up period swaps (any i↔j) that clear/improve deficits
+ * - Within-group period swaps (any group × any i↔j) that clear/improve deficits
+ * - Percent-match rebuild + locked-group redistributions
  */
 export function buildScheduleFixOptions(scheduleRows = []) {
   const rows = Array.isArray(scheduleRows) ? scheduleRows : []
   if (rows.length < 2) {
-    return { swapOptions: [], percentMatch: null }
+    return { swapOptions: [], percentMatch: null, perGroupEdits: [] }
   }
 
   const periods = rows.map((r, index) => ({
@@ -880,6 +883,36 @@ export function buildScheduleFixOptions(scheduleRows = []) {
   const base = scoreBillings(baseline)
   const swapOptions = []
 
+  const pushSwap = ({
+    kind,
+    summary,
+    swap,
+    trial,
+    scored,
+    clearsAll,
+    groupTitle = null,
+    page = null,
+  }) => {
+    swapOptions.push({
+      kind,
+      effort: 'low',
+      summary,
+      groupTitle,
+      page,
+      swap,
+      resultingSchedule: periods.map((p, k) => ({
+        periodLabel: p.periodLabel,
+        distributorCost: roundMoney(p.distributorCost),
+        customerBilling: roundMoney(trial[k]),
+        netCashFlow: scored.nets[k],
+        hasDeficit: scored.nets[k] < -0.05,
+      })),
+      clearsAllDeficits: clearsAll,
+      remainingDeficitCount: scored.deficitCount,
+    })
+  }
+
+  // A) Roll-up swaps: exchange two period totals across the whole quote
   for (let i = 0; i < periods.length; i++) {
     for (let j = i + 1; j < periods.length; j++) {
       if (Math.abs(baseline[i] - baseline[j]) < 0.009) continue
@@ -895,9 +928,8 @@ export function buildScheduleFixOptions(scheduleRows = []) {
         scored.deficitSum > base.deficitSum + 0.05
       if (!clearsAll && !fewerDeficits && !betterCash) continue
 
-      swapOptions.push({
+      pushSwap({
         kind: 'swap',
-        effort: 'low',
         summary: `Swap the customer billing amounts between ${periods[i].periodLabel} and ${periods[j].periodLabel} (same dollars, different periods — no recalculation).`,
         swap: {
           a: {
@@ -911,16 +943,74 @@ export function buildScheduleFixOptions(scheduleRows = []) {
             to: roundMoney(trial[j]),
           },
         },
-        resultingSchedule: periods.map((p, k) => ({
-          periodLabel: p.periodLabel,
-          distributorCost: roundMoney(p.distributorCost),
-          customerBilling: roundMoney(trial[k]),
-          netCashFlow: scored.nets[k],
-          hasDeficit: scored.nets[k] < -0.05,
-        })),
-        clearsAllDeficits: clearsAll,
-        remainingDeficitCount: scored.deficitCount,
+        trial,
+        scored,
+        clearsAll,
       })
+    }
+  }
+
+  // B) Within-group period swaps: only one section's Billing Schedule changes.
+  // Often clears a roll-up deficit when a full period-total swap would not.
+  /** @type {Map<string, { groupTitle: string, page: number|null, amounts: number[] }>} */
+  const groupsByKey = new Map()
+  rows.forEach((row, periodIndex) => {
+    for (const c of row.contributions || []) {
+      const key = `${c.groupTitle || 'Section'}::${c.page ?? ''}`
+      if (!groupsByKey.has(key)) {
+        groupsByKey.set(key, {
+          groupTitle: c.groupTitle || 'Untitled section',
+          page: c.page ?? null,
+          amounts: rows.map(() => 0),
+        })
+      }
+      const g = groupsByKey.get(key)
+      g.amounts[periodIndex] = roundMoney(
+        (g.amounts[periodIndex] || 0) + (toNumber(c.amount) || 0),
+      )
+    }
+  })
+
+  for (const g of groupsByKey.values()) {
+    for (let i = 0; i < periods.length; i++) {
+      for (let j = i + 1; j < periods.length; j++) {
+        const ai = toNumber(g.amounts[i]) || 0
+        const aj = toNumber(g.amounts[j]) || 0
+        if (Math.abs(ai - aj) < 0.009) continue
+        const trial = baseline.slice()
+        trial[i] = roundMoney(trial[i] - ai + aj)
+        trial[j] = roundMoney(trial[j] - aj + ai)
+        const scored = scoreBillings(trial)
+        const clearsAll = scored.deficitCount === 0
+        const fewerDeficits = scored.deficitCount < base.deficitCount
+        const betterCash =
+          scored.deficitCount === base.deficitCount &&
+          scored.deficitSum > base.deficitSum + 0.05
+        if (!clearsAll && !fewerDeficits && !betterCash) continue
+
+        const pageBit = g.page != null ? ` (PDF p.${g.page})` : ''
+        pushSwap({
+          kind: 'group_swap',
+          groupTitle: g.groupTitle,
+          page: g.page,
+          summary: `In ${g.groupTitle}${pageBit}, swap ${periods[i].periodLabel} and ${periods[j].periodLabel} on that group's Billing Schedule (group total unchanged).`,
+          swap: {
+            a: {
+              periodLabel: periods[i].periodLabel,
+              from: roundMoney(ai),
+              to: roundMoney(aj),
+            },
+            b: {
+              periodLabel: periods[j].periodLabel,
+              from: roundMoney(aj),
+              to: roundMoney(ai),
+            },
+          },
+          trial,
+          scored,
+          clearsAll,
+        })
+      }
     }
   }
 
@@ -928,13 +1018,18 @@ export function buildScheduleFixOptions(scheduleRows = []) {
     if (a.clearsAllDeficits !== b.clearsAllDeficits) {
       return a.clearsAllDeficits ? -1 : 1
     }
+    // Prefer within-group swaps (smaller edit) when both clear
+    if (a.kind !== b.kind) {
+      if (a.kind === 'group_swap') return -1
+      if (b.kind === 'group_swap') return 1
+    }
     if (a.remainingDeficitCount !== b.remainingDeficitCount) {
       return a.remainingDeficitCount - b.remainingDeficitCount
     }
     return 0
   })
 
-  // Prefer swaps that fully clear deficits; only fall back to "improves" if none clear.
+  // Prefer swaps that fully clear deficits; otherwise show improving swaps.
   const clearingSwaps = swapOptions.filter((s) => s.clearsAllDeficits)
   const chosenSwaps = (
     clearingSwaps.length ? clearingSwaps : swapOptions
@@ -994,14 +1089,111 @@ export function buildScheduleFixOptions(scheduleRows = []) {
         }
       : null
 
+  const perGroupEdits = buildPerGroupScheduleEdits(rows, percentMatch)
+
   return {
     swapOptions: chosenSwaps,
     percentMatch,
+    perGroupEdits,
   }
+}
+
+/**
+ * Locked-group % distribution for "Edit each group's Billing Schedule".
+ *
+ * NEVER: newPayment = oldPayment * (targetYearTotal / oldYearTotal)
+ * that uses a different multiplier per year and changes the group sum.
+ *
+ * ALWAYS: newPayment[i] = lockedGroupTotal * (distributorCost[i] / totalDistributorCost)
+ * with the last period taking the remainder so Σ newPayments === lockedGroupTotal.
+ */
+export function buildPerGroupScheduleEdits(scheduleRows = [], _percentMatch = null) {
+  const rows = Array.isArray(scheduleRows) ? scheduleRows : []
+  if (!rows.length) return []
+
+  const totalDistributorCost = rows.reduce(
+    (a, r) => a + (toNumber(r.distributorCost) || 0),
+    0,
+  )
+  if (totalDistributorCost <= 0) return []
+
+  // 1) Distributor period percentages (quote-specific)
+  const periodRatios = rows.map((r) => {
+    const cost = toNumber(r.distributorCost) || 0
+    return cost / totalDistributorCost
+  })
+
+  const periodLabels = rows.map(
+    (r, index) => r.periodLabel || `Period ${index + 1}`,
+  )
+
+  // Collect each group's current period payments + locked total
+  /** @type {Map<string, { groupTitle: string, page: number|null, oldPayments: number[] }>} */
+  const byGroup = new Map()
+
+  rows.forEach((row, periodIndex) => {
+    for (const c of row.contributions || []) {
+      const key = `${c.groupTitle || 'Section'}::${c.page ?? ''}`
+      if (!byGroup.has(key)) {
+        byGroup.set(key, {
+          groupTitle: c.groupTitle || 'Untitled section',
+          page: c.page ?? null,
+          oldPayments: rows.map(() => 0),
+        })
+      }
+      const g = byGroup.get(key)
+      g.oldPayments[periodIndex] = roundMoney(
+        (g.oldPayments[periodIndex] || 0) + (toNumber(c.amount) || 0),
+      )
+    }
+  })
+
+  if (!byGroup.size) return []
+
+  // 2) Rebalance WITHIN each group's locked total
+  return [...byGroup.values()].map((group) => {
+    const lockedTotal = roundMoney(
+      group.oldPayments.reduce((a, n) => a + (toNumber(n) || 0), 0),
+    )
+
+    let runningSum = 0
+    const newPayments = periodRatios.map((ratio, index) => {
+      if (index === periodRatios.length - 1) {
+        return roundMoney(lockedTotal - runningSum)
+      }
+      const val = roundMoney(lockedTotal * ratio)
+      runningSum = roundMoney(runningSum + (val || 0))
+      return val
+    })
+
+    const periods = periodLabels.map((periodLabel, index) => ({
+      periodLabel,
+      currentAmount: roundMoney(group.oldPayments[index] || 0),
+      suggestedAmount: newPayments[index],
+      distributorSharePercent: roundPct(periodRatios[index] * 100, 1),
+    }))
+
+    return {
+      groupTitle: group.groupTitle,
+      page: group.page,
+      periods,
+      lockedTotal,
+      currentTotal: lockedTotal,
+      suggestedTotal: lockedTotal,
+      groupTotal: lockedTotal,
+      oldPayments: group.oldPayments.map((n) => roundMoney(n)),
+      newPayments,
+    }
+  })
 }
 
 /** Resolve fix options from error math or recompute from scheduleComparison. */
 export function resolveScheduleFixOptions(error) {
+  const rows = error?.scheduleComparison
+  // Always recompute from rows so locked-group algorithm applies to old sessions
+  if (Array.isArray(rows) && rows.length >= 2) {
+    return buildScheduleFixOptions(rows)
+  }
   const existing = error?.math?.scheduleFixOptions
   if (
     existing &&
@@ -1010,11 +1202,7 @@ export function resolveScheduleFixOptions(error) {
   ) {
     return existing
   }
-  const rows = error?.scheduleComparison
-  if (Array.isArray(rows) && rows.length >= 2) {
-    return buildScheduleFixOptions(rows)
-  }
-  return { swapOptions: [], percentMatch: null }
+  return { swapOptions: [], percentMatch: null, perGroupEdits: [] }
 }
 
 /**
@@ -1023,15 +1211,18 @@ export function resolveScheduleFixOptions(error) {
  */
 export function buildScheduleFixAnswer(error) {
   const fixes = resolveScheduleFixOptions(error)
-  const clearingSwaps = (fixes.swapOptions || []).filter(
-    (s) => s.clearsAllDeficits,
+  const viableSwaps = fixes.swapOptions || []
+  const clearingSwaps = viableSwaps.filter((s) => s.clearsAllDeficits)
+  const swapsToShow = (clearingSwaps.length ? clearingSwaps : viableSwaps).slice(
+    0,
+    2,
   )
   const percent = fixes.percentMatch
   const percentClears =
     percent?.resultingNets?.length > 0 &&
     percent.resultingNets.every((n) => !n.hasDeficit)
 
-  if (!clearingSwaps.length && !percent?.periods?.length) return null
+  if (!swapsToShow.length && !percent?.periods?.length) return null
 
   const parts = []
   const deficitPeriods = error?.math?.deficitPeriods || []
@@ -1047,21 +1238,32 @@ export function buildScheduleFixAnswer(error) {
     `The cash-flow gap is timing: ${deficitLabel} does not collect enough from the customer to cover what Dynamix owes the distributor in that period.`,
   )
 
-  if (clearingSwaps.length) {
-    const s = clearingSwaps[0]
-    const a = s.swap?.a
-    const b = s.swap?.b
-    parts.push(
-      `Easiest fix: swap the existing customer billing amounts between ${a?.periodLabel} and ${b?.periodLabel} — no recalculation. Put ${formatMoney(a?.to)} on ${a?.periodLabel} (currently ${formatMoney(a?.from)}) and ${formatMoney(b?.to)} on ${b?.periodLabel} (currently ${formatMoney(b?.from)}). That clears every period deficit while keeping the same customer total.`,
-    )
-    if (s.resultingSchedule?.length) {
-      const after = s.resultingSchedule
-        .map(
-          (p) =>
-            `${p.periodLabel}: customer ${formatMoney(p.customerBilling)} (net ${formatMoney(p.netCashFlow)})`,
+  if (swapsToShow.length) {
+    for (const s of swapsToShow) {
+      const a = s.swap?.a
+      const b = s.swap?.b
+      const clears = s.clearsAllDeficits
+        ? ' That clears every period deficit.'
+        : ' That improves the cash-flow position.'
+      if (s.kind === 'group_swap') {
+        const pageBit = s.page != null ? ` (PDF p.${s.page})` : ''
+        parts.push(
+          `Easiest fix: in ${s.groupTitle || 'that quote group'}${pageBit}, swap ${a?.periodLabel} and ${b?.periodLabel} on the Billing Schedule — ${formatMoney(a?.from)} ↔ ${formatMoney(b?.from)}. The group total stays the same; no recalculation.${clears}`,
         )
-        .join('; ')
-      parts.push(`After that swap: ${after}.`)
+      } else {
+        parts.push(
+          `Easiest fix: swap the customer billing amounts between ${a?.periodLabel} and ${b?.periodLabel} — put ${formatMoney(a?.to)} on ${a?.periodLabel} (currently ${formatMoney(a?.from)}) and ${formatMoney(b?.to)} on ${b?.periodLabel} (currently ${formatMoney(b?.from)}). No recalculation.${clears}`,
+        )
+      }
+      if (s.resultingSchedule?.length && clears) {
+        const after = s.resultingSchedule
+          .map(
+            (p) =>
+              `${p.periodLabel}: customer ${formatMoney(p.customerBilling)} (net ${formatMoney(p.netCashFlow)})`,
+          )
+          .join('; ')
+        parts.push(`After that swap: ${after}.`)
+      }
     }
   }
 
@@ -1082,6 +1284,24 @@ export function buildScheduleFixAnswer(error) {
       .join('; ')
     parts.push(
       `${lead}: take each distributor period's share of total cost and multiply by the customer sell total (${formatMoney(percent.customerTotal)}). Suggested customer schedule: ${lines}.${percentClears ? ' That pattern also keeps every period cash-positive.' : ''}`,
+    )
+  }
+
+  const perGroup = fixes.perGroupEdits || []
+  if (perGroup.length) {
+    const groupLines = perGroup.map((g) => {
+      const pageBit = g.page != null ? ` (PDF p.${g.page})` : ''
+      const locked = g.groupTotal ?? g.currentTotal
+      const schedule = (g.periods || [])
+        .map(
+          (p) =>
+            `${p.periodLabel}: change ${formatMoney(p.currentAmount)} → ${formatMoney(p.suggestedAmount)}`,
+        )
+        .join('; ')
+      return `${g.groupTitle}${pageBit}: open that section's Billing Schedule and set ${schedule}. Group total stays locked at ${formatMoney(locked)} (sum of the new period payments).`
+    })
+    parts.push(
+      `How to change it inside each quote group (distributor % applied within each group's locked total):\n${groupLines.map((l) => `- ${l}`).join('\n')}`,
     )
   }
 

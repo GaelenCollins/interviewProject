@@ -29,9 +29,18 @@ export default function Workspace({
   chatDisabled = false,
   isChecking = false,
   checkStatus = '',
+  exportRequestKey = 0,
 }) {
   const [docView, setDocView] = useState('pdf') // pdf | excel
   const lastSwitchedFocusRef = useRef(0)
+  const lastExportKeyRef = useRef(0)
+
+  // Chat / UI can request annotated PDF export — ensure PDF view is active.
+  useEffect(() => {
+    if (!exportRequestKey || exportRequestKey === lastExportKeyRef.current) return
+    lastExportKeyRef.current = exportRequestKey
+    setDocView('pdf')
+  }, [exportRequestKey])
 
   // When user picks an issue, jump to the view that can show it.
   // PDF-only → PDF; Excel-only → Excel. Mixed stays on current view.
@@ -135,6 +144,7 @@ export default function Workspace({
                 zoom={zoom}
                 onZoomChange={onZoomChange}
                 onSelectError={onSelectError}
+                exportRequestKey={exportRequestKey}
               />
             )}
           </div>

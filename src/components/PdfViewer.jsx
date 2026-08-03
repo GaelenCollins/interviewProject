@@ -112,6 +112,8 @@ export default function PdfViewer({
   zoom,
   onZoomChange,
   onSelectError,
+  /** Bump from chat/header to start annotated PDF export without a button click */
+  exportRequestKey = 0,
 }) {
   const [numPages, setNumPages] = useState(null)
   const [loadError, setLoadError] = useState('')
@@ -124,6 +126,8 @@ export default function PdfViewer({
   const pageRefs = useRef({})
   const highlightAnchorRefs = useRef({})
   const suppressScrollSync = useRef(false)
+  const markerTimerRef = useRef(null)
+  const highlightTimersRef = useRef({})
 
   const totalPages = numPages || 1
   const safePage = Math.min(Math.max(activePage, 1), totalPages)
@@ -217,6 +221,10 @@ export default function PdfViewer({
     }
   }
 
+  /**
+   * Scrollbar dots use stable page geometry only — never live highlight anchors.
+   * Anchors remount while scrolling / text-layer paints and caused marker flash.
+   */
   const measureMarkers = () => {
     const root = scrollRef.current
     if (!root || !numPages) return
@@ -224,59 +232,112 @@ export default function PdfViewer({
     const contentHeight = root.scrollHeight
     if (contentHeight <= 0) return
 
-    const next = visibleErrors
-      .filter((error) => error.page >= 1 && error.page <= numPages)
-      .map((error) => {
-        const anchor = highlightAnchorRefs.current[error.id]
-        const el = pageRefs.current[error.page]
-        if (anchor && root.contains(anchor)) {
-          const top = anchor.offsetTop + (el?.offsetTop || 0) + anchor.offsetHeight / 2
-          return {
-            id: error.id,
-            page: error.page,
-            severity: error.severity,
-            percent: Math.min(98, Math.max(1, (top / contentHeight) * 100)),
-          }
-        }
-        if (!el) {
-          return {
-            id: error.id,
-            page: error.page,
-            severity: error.severity,
-            percent: ((error.page - 0.5) / numPages) * 100,
-          }
-        }
-        const top = el.offsetTop + el.offsetHeight * 0.15
-        return {
-          id: error.id,
-          page: error.page,
-          severity: error.severity,
-          percent: Math.min(98, Math.max(1, (top / contentHeight) * 100)),
-        }
+    const next = []
+    for (const error of visibleErrors) {
+      const pageCandidates = [
+        ...(Array.isArray(error.pdfPages) ? error.pdfPages : []),
+        error.page,
+      ]
+        .map(Number)
+        .filter((p) => Number.isFinite(p) && p >= 1 && p <= numPages)
+      if (!pageCandidates.length) continue
+      // One marker per issue at its earliest page (stable; no multi-dot flicker)
+      const page = Math.min(...pageCandidates)
+      const el = pageRefs.current[page]
+      let percent
+      if (el && el.offsetHeight > 0) {
+        const top = el.offsetTop + el.offsetHeight * 0.12
+        percent = (top / contentHeight) * 100
+      } else {
+        percent = ((page - 0.5) / numPages) * 100
+      }
+      percent = Math.round(Math.min(98, Math.max(1, percent)) * 10) / 10
+      next.push({
+        id: error.id,
+        page,
+        severity: error.severity,
+        percent,
       })
+    }
 
-    setMarkerPercents(next)
+    setMarkerPercents((prev) => {
+      if (
+        prev.length === next.length &&
+        prev.every(
+          (p, i) =>
+            p.id === next[i].id &&
+            p.page === next[i].page &&
+            Math.abs(p.percent - next[i].percent) < 0.2,
+        )
+      ) {
+        return prev
+      }
+      return next
+    })
   }
 
+  const scheduleMeasureMarkers = () => {
+    if (markerTimerRef.current) window.clearTimeout(markerTimerRef.current)
+    markerTimerRef.current = window.setTimeout(() => {
+      markerTimerRef.current = null
+      measureMarkers()
+    }, 120)
+  }
+
+  // Remeasure highlights as soon as findings arrive (pages may already be painted).
+  // Switching Excel→PDF used to be the only remount that triggered this.
+  const errorHighlightKey = visibleErrors
+    .map(
+      (e) =>
+        `${e.id}:${e.page}:${(e.pdfPages || []).join(',')}:${e.type}:${(e.highlightTerms || []).slice(0, 3).join('|')}`,
+    )
+    .join(';')
+
   useEffect(() => {
-    measureMarkers()
+    if (!numPages) return undefined
+    measureAllHighlights()
+    scheduleMeasureMarkers()
+    const timers = [120, 350, 700].map((ms) =>
+      window.setTimeout(() => {
+        measureAllHighlights()
+        scheduleMeasureMarkers()
+      }, ms),
+    )
+    return () => timers.forEach((id) => window.clearTimeout(id))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [numPages, errorHighlightKey, zoom, pdfUrl])
+
+  useEffect(() => {
+    scheduleMeasureMarkers()
     const root = scrollRef.current
     if (!root) return undefined
 
-    const onResize = () => {
+    const onWindowResize = () => {
       measureAllHighlights()
-      measureMarkers()
+      scheduleMeasureMarkers()
     }
-    window.addEventListener('resize', onResize)
-    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(onResize) : null
+    window.addEventListener('resize', onWindowResize)
+    // Only remeasure markers when the scroll content size changes (pages load),
+    // not on every highlight overlay remount.
+    let lastHeight = root.scrollHeight
+    const ro =
+      typeof ResizeObserver !== 'undefined'
+        ? new ResizeObserver(() => {
+            const h = root.scrollHeight
+            if (Math.abs(h - lastHeight) < 8) return
+            lastHeight = h
+            scheduleMeasureMarkers()
+          })
+        : null
     ro?.observe(root)
 
     return () => {
-      window.removeEventListener('resize', onResize)
+      window.removeEventListener('resize', onWindowResize)
       ro?.disconnect()
+      if (markerTimerRef.current) window.clearTimeout(markerTimerRef.current)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [numPages, visibleErrors, zoom, pdfUrl, pageHighlights])
+  }, [numPages, zoom, pdfUrl])
 
   const scrollToPage = (page, { smooth = true } = {}) => {
     const el = pageRefs.current[page]
@@ -406,6 +467,16 @@ export default function PdfViewer({
     }
   }
 
+  const lastExportRequestRef = useRef(0)
+  useEffect(() => {
+    if (!exportRequestKey || exportRequestKey === lastExportRequestRef.current) {
+      return
+    }
+    lastExportRequestRef.current = exportRequestKey
+    handleExportAnnotated()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [exportRequestKey])
+
   return (
     <div className="flex flex-col h-full min-h-0 bg-brand-main overflow-hidden">
       <div className="flex items-center justify-between gap-2 px-4 py-2.5 shrink-0 bg-black/25 border-b border-white/10">
@@ -515,14 +586,18 @@ export default function PdfViewer({
                         renderTextLayer
                         renderAnnotationLayer
                         onRenderSuccess={() => {
-                          // Text layer paints slightly after canvas — remeasure twice
-                          const run = () => {
-                            measureHighlightsForPage(pageNumber)
-                            measureMarkers()
-                          }
+                          // Debounce text-layer highlight measure; markers stay page-based
+                          const prev = highlightTimersRef.current[pageNumber] || []
+                          prev.forEach((id) => window.clearTimeout(id))
+                          const run = () => measureHighlightsForPage(pageNumber)
                           window.requestAnimationFrame(run)
-                          window.setTimeout(run, 80)
-                          window.setTimeout(run, 250)
+                          highlightTimersRef.current[pageNumber] = [
+                            window.setTimeout(run, 100),
+                            window.setTimeout(() => {
+                              run()
+                              scheduleMeasureMarkers()
+                            }, 280),
+                          ]
                         }}
                       />
 
@@ -600,16 +675,14 @@ export default function PdfViewer({
                   e.stopPropagation()
                   onSelectError?.(marker.id)
                 }}
-                className={`pointer-events-auto absolute left-1/2 -translate-x-1/2 -translate-y-1/2 w-3.5 h-3.5 rounded-full border-2 border-white shadow-md transition-transform hover:scale-125 cursor-pointer ${
+                className={`pointer-events-auto absolute left-1/2 -translate-x-1/2 -translate-y-1/2 w-3.5 h-3.5 rounded-full border-2 border-white shadow-md hover:scale-110 cursor-pointer ${
                   marker.severity === 'CRITICAL'
                     ? 'bg-brand-acc1'
                     : marker.severity === 'WARNING'
                       ? 'bg-brand-acc2'
                       : 'bg-slate-500'
                 } ${
-                  activeErrorId === marker.id
-                    ? 'scale-125 ring-2 ring-white/60'
-                    : ''
+                  activeErrorId === marker.id ? 'ring-2 ring-white/60 scale-110' : ''
                 }`}
                 style={{ top: `${marker.percent}%` }}
               />
