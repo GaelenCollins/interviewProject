@@ -1,11 +1,26 @@
 import { AlertTriangle, Info, RotateCcw } from 'lucide-react'
 import { CUSTOMER_QUOTE, DISTRIBUTOR_QUOTE, skuLabel } from '../constants/labels'
+import PaymentScheduleBreakdown from './PaymentScheduleBreakdown'
+import MarginBreakdown from './MarginBreakdown'
 
 function cleanMessage(error) {
   return String(error.message || '')
     .replace(/^(CRITICAL|WARNING|NOTICE):\s*/i, '')
     .replace(/\s*\[[^\]]*Excel[^\]]*\]\s*$/i, '')
     .trim()
+}
+
+function hasBreakdown(error) {
+  return Boolean(
+    error?.showScheduleTable ||
+      error?.scheduleComparison?.length ||
+      error?.showMarginTable ||
+      error?.omittedTerms?.length ||
+      error?.detailLines?.length ||
+      /MARGIN|ZERO|NEGATIVE|FLOOR|CEILING|OUTLIER|TARGET_BAND|PAYMENT_SCHEDULE|CASH.?FLOW|OMITTED_DISTRIBUTOR/i.test(
+        error?.type || '',
+      ),
+  )
 }
 
 function LocationBlock({ error, styles }) {
@@ -63,6 +78,61 @@ function LocationBlock({ error, styles }) {
   )
 }
 
+function noteTopicLabel(term) {
+  const blob = `${term?.text || ''} ${(term?.keywords || []).join(' ')}`.toLowerCase()
+  if (/payment|due|net\s*\d+|billing/.test(blob)) return 'Payment terms'
+  if (/ship|shipment|ship-to|address/.test(blob)) return 'Shipping / ship-to'
+  if (/license|version|support/.test(blob)) return 'License / support'
+  if (/renewal|coterm/.test(blob)) return 'Renewal / coterm'
+  return 'Distributor note'
+}
+
+function shortQuote(text, max = 140) {
+  const t = String(text || '').replace(/\s+/g, ' ').trim()
+  if (t.length <= max) return t
+  return `${t.slice(0, max - 1)}…`
+}
+
+function OmittedTermsDetail({ terms = [] }) {
+  if (!terms.length) return null
+  return (
+    <div
+      className="rounded-xl border border-brand-acc2/40 bg-white p-3 space-y-2.5"
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => e.stopPropagation()}
+      role="presentation"
+    >
+      <div className="text-xs font-semibold text-brand-main">
+        What is missing from the PDF
+      </div>
+      <p className="text-[11px] text-slate-500 leading-snug">
+        The distributor Excel Notes mention these points, but the customer quote
+        does not. Worth confirming before send.
+      </p>
+      <ul className="space-y-2">
+        {terms.map((term, i) => (
+          <li
+            key={i}
+            className="rounded-lg border border-slate-100 bg-slate-50/80 px-2.5 py-2"
+          >
+            <div className="text-[11px] font-semibold text-brand-main">
+              {noteTopicLabel(term)}
+            </div>
+            <div className="text-[11px] text-slate-700 leading-snug mt-0.5">
+              “{shortQuote(term.text)}”
+            </div>
+            {term.excelRow != null ? (
+              <div className="text-[10px] text-slate-400 mt-1">
+                Excel Notes · row {term.excelRow}
+              </div>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
 export default function ErrorCard({
   error,
   isActive,
@@ -71,6 +141,8 @@ export default function ErrorCard({
   onIgnore,
   onUnignore,
   onSelect,
+  analysis = null,
+  meanMarginPercent = null,
 }) {
   const severity = error.severity || 'NOTICE'
   const styles = {
@@ -101,6 +173,22 @@ export default function ErrorCard({
   const severityLabel =
     severity === 'CRITICAL' ? 'Critical' : severity === 'WARNING' ? 'Warning' : 'Notice'
 
+  const showMargin =
+    isActive &&
+    !isIgnored &&
+    (error.showMarginTable ||
+      /MARGIN|ZERO|NEGATIVE|FLOOR|CEILING|OUTLIER|TARGET_BAND/i.test(error.type || ''))
+  const showSchedule =
+    isActive &&
+    !isIgnored &&
+    (error.showScheduleTable || error.scheduleComparison?.length) &&
+    error.scheduleComparison?.length
+  const showOmitted =
+    isActive &&
+    !isIgnored &&
+    (error.omittedTerms?.length ||
+      /OMITTED_DISTRIBUTOR/i.test(error.type || ''))
+
   return (
     <div
       role="button"
@@ -119,8 +207,30 @@ export default function ErrorCard({
           <p className="text-sm leading-snug text-slate-800">
             <span className={`font-bold ${styles.label}`}>{severityLabel}: </span>
             {cleanMessage(error)}
+            {!isActive &&
+              hasBreakdown(error) &&
+              !/click for breakdown/i.test(error.message || '') && (
+                <span className="text-slate-500"> Click for breakdown.</span>
+              )}
           </p>
           <LocationBlock error={error} styles={styles} />
+          {showMargin ? (
+            <MarginBreakdown
+              analysis={analysis}
+              focusSku={error.sku}
+              meanMarginPercent={meanMarginPercent}
+            />
+          ) : null}
+          {showSchedule ? (
+            <PaymentScheduleBreakdown
+              scheduleComparison={error.scheduleComparison}
+            />
+          ) : null}
+          {showOmitted ? (
+            <OmittedTermsDetail
+              terms={error.omittedTerms || []}
+            />
+          ) : null}
         </div>
       </div>
 

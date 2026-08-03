@@ -51,7 +51,8 @@ Distributor Quote (Excel Source) line items (SKU, description, qty, cost, discou
 Dynamix Customer Quote (PDF) line items (SKU, description, qty, sell, extended, group, coverage, billing schedule),
 compared lines, SKU presence gaps, check findings, and a PDF text snippet for freeform terms.
 USE that data to answer. Never say you lack line-by-line term visibility or that the audit only covered pricing.
-If something is truly absent from quoteDossier, say exactly what field is missing — do not refuse the whole question.`
+If something is truly absent from quoteDossier, say exactly what field is missing — do not refuse the whole question.
+Ignored findings: checkFindings only lists active (non-ignored) issues. Never mention, summarize, or draft emails about ignored or hidden issues — even if they appeared earlier in the chat history or opening summary. Treat ignored issues as out of scope unless the user explicitly asks about a specific ignored item.`
 
 const CHAT_SYSTEM = `${HUMAN_VOICE}
 ${VISIBILITY_RULES}
@@ -187,18 +188,20 @@ export async function* streamQuickActionWithHaiku({ question, error, context }) 
 ${VISIBILITY_RULES}
 ${REASONING_STYLE}
 Answer quote-check questions briefly (about 3-6 sentences) using quoteDossier.
+Stay strictly on the Active issue below — do not pivot to a different finding unless the user asks.
 Never invent numeric margins; only use numbers in the context.
 Do not suggest a corrected sell price unless the user explicitly asks for one.
 When asked what caused a discrepancy: lead with Excel cost (benchmark) vs SNAP PDF sell.
 For low or 0% margins: this hurts Dynamix profitability; do not say the customer cares about low margin. Treat it as a likely SNAP pricing slip first; margin rebalancing can be a brief aside.
 For high margins (near/over ceiling): that is what a customer could push back on.
+For payment-schedule / cash-flow findings: talk about the deficit periods and billed vs distributor-due amounts from the Active issue.
 For math-related issues, recommend the Calculator in the app header.
 Soft suggestions only ("probably should"); never "needs to be raised".
 Keep any unusual Excel peer-discount note to one short aside: fishy, worth checking, not the cause.
 If unsure of root cause, say so calmly.`,
     user: `Question: ${question}
 
-Active issue:
+Active issue (answer ONLY about this finding):
 ${JSON.stringify(
   {
     id: error?.id,
@@ -208,6 +211,8 @@ ${JSON.stringify(
     message: error?.message,
     locations: error?.locations,
     math: error?.math,
+    scheduleComparison: error?.scheduleComparison || null,
+    omittedTerms: error?.omittedTerms || null,
     excelHints: error?.excelHints || context?.excelHints || [],
     discountContext: error?.discountContext || context?.discountContext || null,
   },
@@ -252,26 +257,35 @@ function buildChatUserPayload({ messages, context, quoteDossier }) {
     .join('\n\n')
 
   const dossier = quoteDossier || context?.quoteDossier || null
+  const activeErrors = (context?.errors || []).filter((e) => !e.hidden)
 
   return `High-level context:
 ${JSON.stringify(
   {
     verdict: context?.verdict,
     meanMarginPercent: context?.analysis?.meanMarginRounded,
-    errorCount: context?.errors?.length,
+    activeErrorCount: activeErrors.length,
+    activeErrors: activeErrors.map((e) => ({
+      id: e.id,
+      severity: e.severity,
+      type: e.type,
+      sku: e.sku,
+      message: e.message,
+    })),
     meta: context?.meta,
   },
   null,
   2,
 )}
 
-Quote dossier (full line-by-line Excel + PDF terms — use this):
+Quote dossier (full line-by-line Excel + PDF terms — use this; checkFindings are active only):
 ${JSON.stringify(dossier, null, 2)}
 
 Conversation:
 ${history}
 
-Reply naturally as the assistant. Use the quote dossier; do not claim you lack line visibility.`
+Reply naturally as the assistant. Use the quote dossier; do not claim you lack line visibility.
+Do not discuss ignored issues. If the user asks for an email or summary of problems, only include active findings.`
 }
 
 /** Sonnet — free-form chat (streamed) for deeper reasoning and synthesis. */
@@ -339,6 +353,61 @@ Quote dossier (line-by-line context):
 ${JSON.stringify(quoteDossier, null, 2)}
 
 Write the opening analysis now. Focus on problems only.`,
+  })
+}
+
+/**
+ * Sonnet — draft an outbound email from the user's perspective (not the app chatbot).
+ * Streams plain text: first line "SUBJECT: ...", then blank line, then body.
+ */
+export async function* streamEmailDraftWithSonnet({
+  quoteDossier,
+  meta,
+  activeErrors = [],
+  verdict = null,
+  pdfFileName = '',
+  quoteNumber = null,
+}) {
+  yield* streamComplete({
+    model: SONNET,
+    maxTokens: 900,
+    temperature: 0.7,
+    system: `${HUMAN_VOICE}
+
+You write email drafts the Dynamix sales user will send themselves (first person: I / we).
+This is a real outbound email, not an in-app assistant reply.
+
+Hard rules:
+- Output format ONLY:
+  Line 1: SUBJECT: <short subject>
+  Line 2: blank
+  Then the email body.
+- Write from the user's perspective to a colleague, manager, or customer contact as appropriate.
+- Use square-bracket placeholders the user can fill in, for example [Recipient Name], [Customer Name], [Your Name], [Your Team].
+- Cover only the active findings provided. Never invent SKUs, prices, or issues.
+- Do not mention this app, the chatbot, Calculator, tabs, buttons, ignore/hide, or any in-product tooling.
+- Do not mention SNAP at all.
+- You may refer to the customer quote PDF / Dynamix Customer Quote and the distributor Excel quote as business files, and note that an annotated PDF is attached.
+- Soft language only (should / could / probably). No must / will block.
+- Low margin = Dynamix profitability concern. High margin = customer/bid concern.
+- Keep it professional and concise (about half a page). Plain text only: no markdown bold, no bullet asterisks for bold, no emojis.`,
+    user: `Draft the email now.
+
+Quote context:
+${JSON.stringify(
+  {
+    quoteNumber,
+    pdfFileName,
+    verdict,
+    meta,
+    activeFindings: activeErrors,
+  },
+  null,
+  2,
+)}
+
+Quote dossier (for accurate SKUs / pages / numbers only):
+${JSON.stringify(quoteDossier, null, 2)}`,
   })
 }
 

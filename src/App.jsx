@@ -1,11 +1,18 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Header from './components/Header'
 import FileUpload from './components/FileUpload'
 import Workspace from './components/Workspace'
 import AiAssistant from './components/AiAssistant'
 import MarginCalculatorModal from './components/MarginCalculatorModal'
 import { AI_RESPONSES } from './data/mockData'
-import { runCheckStream, sendChatStream } from './api/client'
+import { runCheckStream, sendChatStream, streamEmailDraft } from './api/client'
+import { computeVerdict } from './utils/auditEngine'
+import {
+  buildOutlookDraft,
+  downloadOutlookDraft,
+  generateDeterministicEmail,
+  parseLlmEmailDraft,
+} from './utils/outlookDraftBuilder'
 
 export default function App() {
   const [hasUploadedFiles, setHasUploadedFiles] = useState(false)
@@ -18,11 +25,14 @@ export default function App() {
   const [pdfUrl, setPdfUrl] = useState(null)
   const [activeErrorId, setActiveErrorId] = useState(null)
   const [isCalculatorOpen, setIsCalculatorOpen] = useState(false)
+  const [emailExport, setEmailExport] = useState(null)
+  const emailExportBusy = useRef(false)
   const [chatMessages, setChatMessages] = useState([
     { role: 'assistant', text: AI_RESPONSES.welcome },
   ])
   const [errors, setErrors] = useState([])
   const [analysis, setAnalysis] = useState(null)
+  const [quoteNumber, setQuoteNumber] = useState(null)
   const [meanMarginPercent, setMeanMarginPercent] = useState(null)
   const [activePage, setActivePage] = useState(1)
   const [zoom, setZoom] = useState(1)
@@ -64,8 +74,10 @@ export default function App() {
     setHasUploadedFiles(true)
     setErrors([])
     setAnalysis(null)
+    setQuoteNumber(null)
     setMeanMarginPercent(null)
     setActiveErrorId(null)
+    setEmailExport(null)
     setActivePage(1)
     setZoom(1)
     setChatMessages([
@@ -76,11 +88,40 @@ export default function App() {
       },
     ])
 
+    const applyCheckFindings = (payload) => {
+      if (!payload) return
+      if (payload.sessionId) setSessionId(payload.sessionId)
+      if (payload.errors) {
+        setErrors(payload.errors.map((e) => ({ ...e, hidden: false })))
+      }
+      if (payload.analysis) setAnalysis(payload.analysis)
+      setQuoteNumber(
+        payload.meta?.customer?.quoteNumber ||
+          payload.pdfData?.quoteNumber ||
+          null,
+      )
+      setMeanMarginPercent(
+        payload.meta?.meanMarginPercent ??
+          payload.analysis?.meanMarginRounded ??
+          null,
+      )
+      setActiveErrorId(null)
+    }
+
     try {
       const result = await runCheckStream({
         pdfFile: nextPdf,
         excelFile: nextExcel,
-        onProgress: ({ stage, message }) => {
+        onProgress: (payload) => {
+          const { stage, message } = payload || {}
+          if (stage === 'findings') {
+            applyCheckFindings(payload)
+            if (message) {
+              setCheckStatus(message)
+              upsertStreamingAssistant(message, false)
+            }
+            return
+          }
           if (!message) return
           if (stage === 'summary') {
             setCheckStatus('Writing analysis…')
@@ -92,15 +133,8 @@ export default function App() {
         },
       })
 
-      const nextErrors = (result.errors || []).map((e) => ({ ...e, hidden: false }))
-      setSessionId(result.sessionId)
-      setErrors(nextErrors)
-      setAnalysis(result.analysis || null)
-      setMeanMarginPercent(
-        result.meta?.meanMarginPercent ?? result.analysis?.meanMarginRounded ?? null,
-      )
-
-      setActiveErrorId(null)
+      // Final payload may refine meta; findings already painted earlier.
+      applyCheckFindings(result)
 
       const note =
         result.warnings?.length > 0
@@ -160,7 +194,9 @@ export default function App() {
     setZoom(1)
     setErrors([])
     setAnalysis(null)
+    setQuoteNumber(null)
     setMeanMarginPercent(null)
+    setEmailExport(null)
     setChatMessages([{ role: 'assistant', text: AI_RESPONSES.welcome }])
   }
 
@@ -181,11 +217,15 @@ export default function App() {
 
     setIsChatBusy(true)
     try {
+      const hiddenErrorIds = errors
+        .filter((e) => e.hidden)
+        .map((e) => e.id)
       await sendChatStream({
         sessionId,
         message: text,
         mode,
         errorId,
+        hiddenErrorIds,
         onToken: (_token, full) => upsertStreamingAssistant(full, false),
       })
       setChatMessages((prev) => {
@@ -212,7 +252,11 @@ export default function App() {
     const error = errors.find((e) => e.id === id && !e.hidden)
     if (!error) return
     setActiveErrorId(id)
-    setActivePage(error.page || 1)
+    const pdfPage =
+      error.page ||
+      (Array.isArray(error.pdfPages) && error.pdfPages[0]) ||
+      1
+    setActivePage(pdfPage)
     setErrorFocusKey((key) => key + 1)
   }
 
@@ -222,11 +266,27 @@ export default function App() {
       errors.find((e) => e.actions?.some((a) => a.label === action.label))
     if (error) {
       setActiveErrorId(error.id)
-      setActivePage(error.page || 1)
+      const pdfPage =
+        error.page ||
+        (Array.isArray(error.pdfPages) && error.pdfPages[0]) ||
+        1
+      setActivePage(pdfPage)
       setErrorFocusKey((key) => key + 1)
     }
+    // Always name the source issue so chat stays anchored to this card.
+    const issueBits = [
+      error?.id != null ? `issue #${error.id}` : null,
+      error?.type || null,
+      error?.sku || null,
+      error?.severity || null,
+    ].filter(Boolean)
+    const issueRef = issueBits.length ? issueBits.join(' · ') : 'the selected issue'
+    const base = String(action.query || action.label || '').trim()
+    const text = base
+      ? `Regarding ${issueRef}: ${base}`
+      : `Tell me about ${issueRef}.`
     askAssistant({
-      text: action.query || action.label,
+      text,
       mode: 'quick',
       errorId: error?.id ?? null,
     })
@@ -249,13 +309,164 @@ export default function App() {
     setErrorFocusKey((key) => key + 1)
   }
 
+  const handleEmailDownload = useCallback(async () => {
+    if (!pdfFile || emailExportBusy.current) return
+    emailExportBusy.current = true
+
+    const activeErrors = (errors || []).filter((e) => !e.hidden)
+    const hiddenErrorIds = (errors || [])
+      .filter((e) => e.hidden)
+      .map((e) => e.id)
+    const pdfName = pdfFile.name || 'customer_quote.pdf'
+    const quoteRef =
+      quoteNumber ||
+      String(pdfName).replace(/\.pdf$/i, '') ||
+      'Quote'
+    const safeRef = String(quoteRef)
+      .replace(/[^\w.-]+/g, '_')
+      .replace(/_+/g, '_')
+      .slice(0, 80)
+    const downloadName = `Quote_Revision_${safeRef || 'Draft'}.eml`
+    const fallbackBody = generateDeterministicEmail({
+      errors: activeErrors,
+      pdfFileName: pdfName,
+      quoteNumber: quoteRef,
+    })
+
+    setEmailExport({
+      phase: 'drafting',
+      progress: 12,
+        message: 'Drafting your email…',
+        fileName: downloadName,
+      })
+
+    let subject = `Quote review: ${quoteRef}`
+    let body = fallbackBody
+
+    try {
+      if (sessionId) {
+        try {
+          const { answer } = await streamEmailDraft({
+            sessionId,
+            hiddenErrorIds,
+            onToken: () => {
+              setEmailExport((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      progress: Math.min(55, (prev.progress || 12) + 2),
+                      message: 'Drafting your email…',
+                    }
+                  : prev,
+              )
+            },
+          })
+          const parsed = parseLlmEmailDraft(answer)
+          if (parsed.subject) subject = parsed.subject
+          if (parsed.body) body = parsed.body
+        } catch {
+          // Keep deterministic fallback
+        }
+      }
+
+      setEmailExport({
+        phase: 'building',
+        progress: 70,
+        message: 'Building annotated PDF and download…',
+        fileName: downloadName,
+      })
+
+      const pdfArrayBuffer = await pdfFile.arrayBuffer()
+      const blob = await buildOutlookDraft({
+        to: '',
+        subject,
+        bodyText: body,
+        pdfArrayBuffer,
+        auditResults: {
+          errors: activeErrors,
+          verdict: computeVerdict(activeErrors),
+        },
+        fileName: pdfName,
+      })
+
+      downloadOutlookDraft(blob, downloadName)
+
+      setEmailExport({
+        phase: 'done',
+        progress: 100,
+        message: `Download ready — open ${downloadName} to add the recipient in your email app and send.`,
+        fileName: downloadName,
+      })
+    } catch (err) {
+      setEmailExport({
+        phase: 'error',
+        progress: 100,
+        message: err?.message || 'Could not prepare the email download.',
+        fileName: downloadName,
+      })
+    } finally {
+      emailExportBusy.current = false
+    }
+  }, [pdfFile, errors, sessionId, quoteNumber])
+
+  const emailBannerTone =
+    emailExport?.phase === 'error'
+      ? 'bg-brand-acc1 border-brand-acc1 text-white'
+      : emailExport?.phase === 'done'
+        ? 'bg-brand-acc3 border-brand-acc3 text-brand-main'
+        : 'bg-brand-secondary border-brand-secondary text-brand-main'
+
   return (
     <div className="flex flex-col h-screen overflow-hidden bg-brand-main">
       <Header
         onOpenCalculator={() => setIsCalculatorOpen(true)}
+        onOpenEmail={handleEmailDownload}
+        emailDisabled={!pdfFile || isChecking || emailExport?.phase === 'drafting' || emailExport?.phase === 'building'}
         showNewCheck={hasUploadedFiles}
         onNewCheck={handleNewCheck}
       />
+
+      {emailExport ? (
+        <div
+          className={`shrink-0 border-b px-5 py-2.5 ${emailBannerTone}`}
+          role="status"
+        >
+          <div className="flex items-center justify-between gap-3 mb-1.5">
+            <p className="text-xs font-medium leading-snug">
+              {emailExport.message}
+            </p>
+            {emailExport.phase === 'done' || emailExport.phase === 'error' ? (
+              <button
+                type="button"
+                onClick={() => setEmailExport(null)}
+                className={`text-[11px] font-semibold shrink-0 underline-offset-2 hover:underline ${
+                  emailExport.phase === 'error'
+                    ? 'text-white/90 hover:text-white'
+                    : 'text-brand-main/80 hover:text-brand-main'
+                }`}
+              >
+                Dismiss
+              </button>
+            ) : null}
+          </div>
+          <div
+            className={`h-1.5 rounded-full overflow-hidden ${
+              emailExport.phase === 'error' ? 'bg-white/25' : 'bg-brand-main/15'
+            }`}
+          >
+            <div
+              className={`h-full rounded-full transition-[width] duration-300 ${
+                emailExport.phase === 'error'
+                  ? 'bg-white'
+                  : emailExport.phase === 'done'
+                    ? 'bg-brand-main'
+                    : 'bg-brand-main'
+              }`}
+              style={{ width: `${emailExport.progress || 0}%` }}
+            />
+          </div>
+        </div>
+      ) : null}
 
       {hasUploadedFiles ? (
         <Workspace

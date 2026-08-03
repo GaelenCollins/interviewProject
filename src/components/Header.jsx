@@ -1,6 +1,15 @@
-import { Calculator, Layers } from 'lucide-react'
+import { Calculator, Layers, Mail } from 'lucide-react'
 
-export default function Header({ onOpenCalculator, showNewCheck, onNewCheck }) {
+const iconBtnClass =
+  'w-9 h-9 rounded-lg flex items-center justify-center bg-brand-main text-brand-secondary hover:opacity-90 active:scale-95 transition-all disabled:opacity-40'
+
+export default function Header({
+  onOpenCalculator,
+  onOpenEmail,
+  showNewCheck,
+  onNewCheck,
+  emailDisabled = false,
+}) {
   return (
     <header className="shrink-0 flex items-center justify-between px-5 h-[52px] bg-brand-secondary text-brand-main border-b-2 border-brand-main/15">
       <div className="flex items-center gap-3">
@@ -30,11 +39,21 @@ export default function Header({ onOpenCalculator, showNewCheck, onNewCheck }) {
         <button
           type="button"
           onClick={onOpenCalculator}
-          className="w-9 h-9 rounded-lg flex items-center justify-center bg-brand-main text-brand-secondary hover:opacity-90 active:scale-95 transition-all"
+          className={iconBtnClass}
           title="Calculator"
           aria-label="Open calculator"
         >
           <Calculator className="w-[18px] h-[18px]" strokeWidth={1.8} />
+        </button>
+        <button
+          type="button"
+          onClick={onOpenEmail}
+          disabled={emailDisabled}
+          className={iconBtnClass}
+          title="Download email draft"
+          aria-label="Download email draft"
+        >
+          <Mail className="w-[18px] h-[18px]" strokeWidth={1.8} />
         </button>
       </div>
     </header>

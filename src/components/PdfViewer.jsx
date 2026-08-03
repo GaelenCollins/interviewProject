@@ -3,11 +3,18 @@ import { Document, Page, pdfjs } from 'react-pdf'
 import {
   ChevronLeft,
   ChevronRight,
+  Download,
   FileText,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react'
 import { findHighlightRects } from '../utils/pdfHighlights'
+import {
+  buildAnnotatedFilename,
+  downloadBytes,
+  generateAnnotatedPdf,
+} from '../utils/pdfAnnotator'
+import { computeVerdict } from '../utils/auditEngine'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
 
@@ -52,6 +59,8 @@ export default function PdfViewer({
   const [loadError, setLoadError] = useState('')
   const [markerPercents, setMarkerPercents] = useState([])
   const [pageHighlights, setPageHighlights] = useState({})
+  const [exporting, setExporting] = useState(false)
+  const [exportError, setExportError] = useState('')
 
   const scrollRef = useRef(null)
   const pageRefs = useRef({})
@@ -83,10 +92,15 @@ export default function PdfViewer({
     const el = pageRefs.current[pageNumber]
     if (!el) return
 
-    const pageErrors = visibleErrors.filter((e) => e.page === pageNumber)
+    const pageErrors = visibleErrors.filter(
+      (e) =>
+        e.page === pageNumber ||
+        (Array.isArray(e.pdfPages) && e.pdfPages.includes(pageNumber)),
+    )
     const next = []
 
     for (const error of pageErrors) {
+      // Schedule issues: highlightTerms already scoped to problem years + payment amounts
       const terms = error.highlightTerms?.length
         ? error.highlightTerms
         : [error.sku].filter(Boolean)
@@ -95,10 +109,15 @@ export default function PdfViewer({
         // Fallback: still mark near top of page via badge only
         continue
       }
-      for (const rect of rects) {
+      // Sort top-to-bottom so "first instance" navigation is stable
+      const ordered = [...rects].sort(
+        (a, b) => a.top - b.top || a.left - b.left,
+      )
+      for (const rect of ordered) {
         next.push({
           errorId: error.id,
           severity: error.severity,
+          page: pageNumber,
           ...rect,
         })
       }
@@ -109,6 +128,8 @@ export default function PdfViewer({
 
   const measureAllHighlights = () => {
     if (!numPages) return
+    // Reset first-instance anchors so problem-year highlights re-rank cleanly
+    highlightAnchorRefs.current = {}
     for (let p = 1; p <= numPages; p++) {
       measureHighlightsForPage(p)
     }
@@ -192,7 +213,7 @@ export default function PdfViewer({
     if (!error) return
     const root = scrollRef.current
     const anchor = highlightAnchorRefs.current[error.id]
-    if (!root) return
+    if (!root) return false
 
     suppressScrollSync.current = true
     if (anchor) {
@@ -201,16 +222,24 @@ export default function PdfViewer({
       const top =
         root.scrollTop + (anchorRect.top - rootRect.top) - root.clientHeight * 0.3
       root.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
-    } else {
-      scrollToPage(error.page)
+      window.setTimeout(() => {
+        suppressScrollSync.current = false
+      }, 450)
+      return true
     }
+    const page =
+      error.page ||
+      (Array.isArray(error.pdfPages) && error.pdfPages[0]) ||
+      null
+    if (page) scrollToPage(page)
     window.setTimeout(() => {
       suppressScrollSync.current = false
     }, 450)
+    return false
   }
 
   // Only jump when the user explicitly picks an issue (errorFocusKey bumps).
-  // Do not re-pull them back after they scroll away, or when highlights remeasure.
+  // Retry briefly until the first highlight rect exists (problem-year payments).
   const lastFocusKeyRef = useRef(0)
   useEffect(() => {
     if (!numPages || !errorFocusKey || activeErrorId == null) return
@@ -218,8 +247,22 @@ export default function PdfViewer({
     lastFocusKeyRef.current = errorFocusKey
     const error = errors.find((e) => e.id === activeErrorId && !e.hidden)
     if (!error) return
-    const t = window.setTimeout(() => scrollToError(error), 80)
-    return () => window.clearTimeout(t)
+
+    let cancelled = false
+    let attempts = 0
+    const tryScroll = () => {
+      if (cancelled) return
+      const ok = scrollToError(error)
+      attempts += 1
+      if (!ok && attempts < 10) {
+        window.setTimeout(tryScroll, 120)
+      }
+    }
+    const t = window.setTimeout(tryScroll, 80)
+    return () => {
+      cancelled = true
+      window.clearTimeout(t)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [errorFocusKey, numPages])
 
@@ -263,16 +306,50 @@ export default function PdfViewer({
     onPageChange(next)
   }
 
+  const handleExportAnnotated = async () => {
+    if (!pdfFile || exporting) return
+    setExporting(true)
+    setExportError('')
+    try {
+      const buffer = await pdfFile.arrayBuffer()
+      const annotated = await generateAnnotatedPdf(buffer, {
+        errors: visibleErrors,
+        verdict: computeVerdict(visibleErrors),
+      })
+      downloadBytes(annotated, buildAnnotatedFilename(pdfFile.name))
+    } catch (err) {
+      setExportError(err?.message || 'Could not export annotated PDF')
+    } finally {
+      setExporting(false)
+    }
+  }
+
   return (
     <div className="flex flex-col h-full min-h-0 bg-brand-main overflow-hidden">
-      <div className="flex items-center px-4 py-2.5 shrink-0 bg-black/25 border-b border-white/10">
+      <div className="flex items-center justify-between gap-2 px-4 py-2.5 shrink-0 bg-black/25 border-b border-white/10">
         <span
-          className="text-xs font-medium text-white/50 font-mono truncate"
+          className="text-xs font-medium text-white/50 font-mono truncate min-w-0"
           title={pdfFile?.name}
         >
           {pdfFile?.name || 'customer_quote.pdf'}
         </span>
+        <button
+          type="button"
+          onClick={handleExportAnnotated}
+          disabled={!pdfFile || exporting}
+          className="shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold bg-brand-secondary/20 text-brand-secondary hover:bg-brand-secondary/30 disabled:opacity-40 transition-colors"
+          title="Export Annotated PDF"
+          aria-label="Export Annotated PDF"
+        >
+          <Download className="w-3.5 h-3.5" />
+          {exporting ? 'Exporting…' : 'Export Annotated PDF'}
+        </button>
       </div>
+      {exportError ? (
+        <div className="shrink-0 px-4 py-1.5 text-[11px] text-brand-acc1 bg-brand-acc1/10 border-b border-brand-acc1/30">
+          {exportError}
+        </div>
+      ) : null}
 
       <div className="relative flex-1 min-h-0">
         <div
@@ -310,7 +387,10 @@ export default function PdfViewer({
                 {Array.from({ length: totalPages }, (_, i) => {
                   const pageNumber = i + 1
                   const pageErrors = visibleErrors.filter(
-                    (e) => e.page === pageNumber,
+                    (e) =>
+                      e.page === pageNumber ||
+                      (Array.isArray(e.pdfPages) &&
+                        e.pdfPages.includes(pageNumber)),
                   )
                   const highlights = pageHighlights[pageNumber] || []
                   return (
@@ -370,8 +450,25 @@ export default function PdfViewer({
                               key={`${h.errorId}-${idx}`}
                               type="button"
                               ref={(el) => {
-                                if (idx === 0 && el) {
+                                if (!el) return
+                                // Keep earliest page + topmost rect as the jump target
+                                const prev = highlightAnchorRefs.current[h.errorId]
+                                const prevMeta =
+                                  highlightAnchorRefs.current[`${h.errorId}:meta`]
+                                const meta = {
+                                  page: h.page || pageNumber,
+                                  top: h.top,
+                                }
+                                if (
+                                  !prev ||
+                                  !prevMeta ||
+                                  meta.page < prevMeta.page ||
+                                  (meta.page === prevMeta.page &&
+                                    meta.top < prevMeta.top)
+                                ) {
                                   highlightAnchorRefs.current[h.errorId] = el
+                                  highlightAnchorRefs.current[`${h.errorId}:meta`] =
+                                    meta
                                 }
                               }}
                               onClick={() => onSelectError?.(h.errorId)}

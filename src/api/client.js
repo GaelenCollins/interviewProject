@@ -75,6 +75,7 @@ export async function sendChatStream({
   message,
   mode = 'chat',
   errorId = null,
+  hiddenErrorIds = [],
   onToken,
 }) {
   const res = await fetch('/api/chat?stream=1', {
@@ -83,7 +84,7 @@ export async function sendChatStream({
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
     },
-    body: JSON.stringify({ sessionId, message, mode, errorId }),
+    body: JSON.stringify({ sessionId, message, mode, errorId, hiddenErrorIds }),
   })
 
   let answer = ''
@@ -101,6 +102,21 @@ export async function sendChatStream({
 
   if (error) throw new Error(error)
   return { answer, mode }
+}
+
+/** Stream an LLM email draft (subject + body) for the current check session. */
+export async function streamEmailDraft({
+  sessionId,
+  hiddenErrorIds = [],
+  onToken,
+}) {
+  return sendChatStream({
+    sessionId,
+    message: 'Draft outbound email',
+    mode: 'email',
+    hiddenErrorIds,
+    onToken,
+  })
 }
 
 export async function getHealth() {

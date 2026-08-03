@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Calculator, X } from 'lucide-react'
 
 function parseNum(value) {
@@ -24,17 +24,47 @@ const TABS = [
 
 /** Pure JS scientific evaluator — no LLM. Degrees for trig. */
 function evaluateScientific(raw) {
-  let expr = String(raw || '').trim()
+  let expr = String(raw || '')
+    .trim()
+    .replace(/=/g, '')
   if (!expr) return null
 
   expr = expr
     .replace(/×/g, '*')
     .replace(/÷/g, '/')
+    .replace(/−/g, '-')
     .replace(/\^/g, '**')
     .replace(/π/g, `(${Math.PI})`)
-    .replace(/(^|[^A-Za-z0-9_.])e(?![A-Za-z0-9_.])/g, `$1(${Math.E})`)
     .replace(/√\s*\(/g, 'sqrt(')
-    .replace(/(\d+(?:\.\d+)?)\s*%/g, '($1/100)')
+
+  // Protect scientific notation (2.4e+10 / 2.4E-3) before Euler "e" rewrite.
+  const sciSlots = []
+  expr = expr.replace(
+    /(\d+(?:\.\d+)?)([eE][+-]?\d+)/g,
+    (_m, mant, expPart) => {
+      const i = sciSlots.length
+      sciSlots.push(`(${mant}${expPart})`)
+      return `__NUM${i}__`
+    },
+  )
+
+  // Bare Euler constant (button "e"), not part of 1e10
+  expr = expr.replace(
+    /(^|[^A-Za-z0-9_.])e(?![A-Za-z0-9_.])/g,
+    `$1(${Math.E})`,
+  )
+
+  // Percent: 50% → (50/100); also after restored nums via placeholder later
+  expr = expr.replace(/(\d+(?:\.\d+)?)\s*%/g, '($1/100)')
+  expr = expr.replace(/(__NUM\d+__)\s*%/g, '($1/100)')
+
+  // Implicit multiply: 2(3), (2)(3), 2π already handled via π→(PI)
+  expr = expr
+    .replace(/(\d)\s*\(/g, '$1*(')
+    .replace(/\)\s*\(/g, ')*(')
+    .replace(/\)\s*(\d)/g, ')*$1')
+    .replace(/(__NUM\d+__)\s*\(/g, '$1*(')
+    .replace(/\)\s*(__NUM\d+__)/g, ')*$1')
 
   // Degrees → radians for trig
   expr = expr
@@ -45,8 +75,11 @@ function evaluateScientific(raw) {
     .replace(/log\s*\(/g, '__log(')
     .replace(/sqrt\s*\(/g, '__sqrt(')
 
-  // Only allow safe tokens after rewrite
-  if (!/^[\d+\-*/().,_\s]+$/.test(expr.replace(/__[a-z]+/g, ''))) {
+  expr = expr.replace(/__NUM(\d+)__/g, (_m, i) => sciSlots[Number(i)])
+
+  // Only allow safe tokens after rewrite (sci e/E ok inside numbers)
+  const stripped = expr.replace(/__(?:sin|cos|tan|ln|log|sqrt)/g, '')
+  if (!/^[\d+\-*/().,eE\s]+$/.test(stripped)) {
     throw new Error('Invalid expression')
   }
 
@@ -76,6 +109,7 @@ function evaluateScientific(raw) {
 function formatCalcDisplay(value) {
   if (!Number.isFinite(value)) return 'Error'
   const abs = Math.abs(value)
+  // Prefer plain decimals when short enough; else scientific (reusable in next calc).
   if (abs !== 0 && (abs >= 1e10 || abs < 1e-6)) {
     return value.toExponential(6)
   }
@@ -86,50 +120,155 @@ function formatCalcDisplay(value) {
 function ScientificCalculator() {
   const [expression, setExpression] = useState('')
   const [display, setDisplay] = useState('0')
+  const [history, setHistory] = useState('')
   const [error, setError] = useState('')
-  const [justEvaluated, setJustEvaluated] = useState(false)
+  // Ref avoids Strict Mode double-invoking nested setState updaters (which doubled keys).
+  const justEvaluatedRef = useRef(false)
 
   const append = (chunk) => {
     setError('')
-    setJustEvaluated((wasJust) => {
-      setExpression((prev) => {
-        if (wasJust && /^[0-9.πe(]/.test(chunk)) return chunk
-        return prev + chunk
-      })
-      return false
-    })
+    if (justEvaluatedRef.current) {
+      const startFresh = /^[0-9.πe(]/.test(chunk)
+      justEvaluatedRef.current = false
+      setHistory('')
+      if (startFresh) {
+        setExpression(chunk)
+        return
+      }
+      // Operator after = continues from the answer (Google-style).
+      setExpression(`${display || '0'}${chunk}`)
+      return
+    }
+    setExpression((prev) => prev + chunk)
   }
 
   const clearAll = () => {
     setExpression('')
     setDisplay('0')
+    setHistory('')
     setError('')
-    setJustEvaluated(false)
+    justEvaluatedRef.current = false
   }
 
   const backspace = () => {
     setError('')
-    setJustEvaluated(false)
-    setExpression((prev) => prev.slice(0, -1))
+    justEvaluatedRef.current = false
+    setHistory('')
+    setExpression((prev) => {
+      if (prev) return prev.slice(0, -1)
+      return ''
+    })
   }
 
   const equals = () => {
+    const source = expression || display
     try {
-      const value = evaluateScientific(expression || display)
+      const value = evaluateScientific(source)
       if (value == null) return
       const formatted = formatCalcDisplay(value)
+      setHistory(`${source} =`)
       setDisplay(formatted)
-      setExpression(formatted)
-      setJustEvaluated(true)
+      setExpression('')
+      justEvaluatedRef.current = true
       setError('')
     } catch {
+      setHistory(source ? `${source} =` : '')
       setError('Invalid expression')
       setDisplay('Error')
-      setJustEvaluated(true)
+      setExpression('')
+      justEvaluatedRef.current = true
     }
   }
 
-  const shown = error ? 'Error' : expression || display || '0'
+  const appendRef = useRef(append)
+  const equalsRef = useRef(equals)
+  const clearAllRef = useRef(clearAll)
+  const backspaceRef = useRef(backspace)
+  appendRef.current = append
+  equalsRef.current = equals
+  clearAllRef.current = clearAll
+  backspaceRef.current = backspace
+
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return
+      const tag = e.target?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target?.isContentEditable) {
+        return
+      }
+
+      const { key } = e
+
+      if (key >= '0' && key <= '9') {
+        e.preventDefault()
+        appendRef.current(key)
+        return
+      }
+
+      switch (key) {
+        case '.':
+          e.preventDefault()
+          appendRef.current('.')
+          break
+        case '+':
+          e.preventDefault()
+          appendRef.current('+')
+          break
+        case '-':
+          e.preventDefault()
+          appendRef.current('-')
+          break
+        case '*':
+          e.preventDefault()
+          appendRef.current('×')
+          break
+        case '/':
+          e.preventDefault()
+          appendRef.current('÷')
+          break
+        case '(':
+        case ')':
+        case '^':
+        case '%':
+          e.preventDefault()
+          appendRef.current(key)
+          break
+        case 'Enter':
+        case '=':
+          e.preventDefault()
+          equalsRef.current()
+          break
+        case 'Backspace':
+          e.preventDefault()
+          backspaceRef.current()
+          break
+        case 'Delete':
+        case 'c':
+        case 'C':
+          e.preventDefault()
+          clearAllRef.current()
+          break
+        case 'e':
+        case 'E':
+          e.preventDefault()
+          appendRef.current('e')
+          break
+        case 'p':
+        case 'P':
+          e.preventDefault()
+          appendRef.current('π')
+          break
+        default:
+          break
+      }
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
+
+  // Google-style: while typing show the equation large; after = show equation above, answer large.
+  const shown = error ? 'Error' : expression !== '' ? expression : display || '0'
 
   const btn =
     'h-10 rounded-lg text-sm font-semibold transition-all active:scale-95 select-none'
@@ -141,14 +280,15 @@ function ScientificCalculator() {
   return (
     <div className="space-y-3">
       <div className="rounded-xl border-[1.5px] border-slate-200 bg-slate-50 px-3 py-3 text-right">
-        <div className="text-2xl font-bold font-mono text-brand-main break-all leading-tight min-h-[2rem]">
+        <div className="min-h-[1.1rem] text-xs font-mono text-slate-400 break-all leading-tight">
+          {history || '\u00a0'}
+        </div>
+        <div className="text-2xl font-bold font-mono text-brand-main break-all leading-tight min-h-[2rem] mt-0.5">
           {shown}
         </div>
         {error ? (
           <div className="text-[11px] text-brand-acc1 mt-1">{error}</div>
-        ) : (
-          <div className="text-[10px] text-slate-400 mt-1">Trig uses degrees · pure JS math</div>
-        )}
+        ) : null}
       </div>
 
       <div className="grid grid-cols-5 gap-1.5">
@@ -227,7 +367,7 @@ function ScientificCalculator() {
           className={opBtn}
           onClick={() => {
             setError('')
-            setJustEvaluated(false)
+            justEvaluatedRef.current = false
             setExpression((prev) => {
               if (!prev) return '-'
               if (/^-?\d*\.?\d+$/.test(prev)) {
@@ -462,6 +602,17 @@ function MarginPercentTab() {
 
 export default function MarginCalculatorModal({ onClose }) {
   const [tab, setTab] = useState('calculator')
+
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        onClose()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [onClose])
 
   return (
     <div

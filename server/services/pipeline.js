@@ -1,6 +1,9 @@
 import { extractPdfText } from './pdf.js'
 import { parseDistributorExcel } from '../../src/utils/excelParser.js'
-import { EMPTY_PDF_QUOTE } from '../../src/utils/pdfSchema.js'
+import {
+  EMPTY_PDF_QUOTE,
+  enrichPdfSchedulePages,
+} from '../../src/utils/pdfSchema.js'
 import {
   auditQuote,
   buildBlockedCheckResult,
@@ -21,6 +24,7 @@ import {
 import {
   extractPdfSchema,
   streamChatWithSonnet,
+  streamEmailDraftWithSonnet,
   streamInitialAnalysisWithSonnet,
   streamQuickActionWithHaiku,
 } from './claude.js'
@@ -46,9 +50,9 @@ export async function runQuoteCheck({
   pdfFilename,
   onProgress,
 }) {
-  const emit = (stage, message) => {
+  const emit = (stage, message, extra = {}) => {
     try {
-      onProgress?.({ stage, message })
+      onProgress?.({ stage, message, ...extra })
     } catch {
       /* ignore */
     }
@@ -124,6 +128,9 @@ export async function runQuoteCheck({
     pdfData.currency = detectCurrency(pdfText.markdown)
   }
 
+  // Map Billing Schedule tables to detail pages (not the page-1 group summary).
+  pdfData = enrichPdfSchedulePages(pdfData, pdfText.markdown || '')
+
   const unrecognized =
     countPdfLineItems(pdfData) === 0 ||
     !looksLikeSnapQuote(pdfText.markdown, pdfData)
@@ -134,12 +141,9 @@ export async function runQuoteCheck({
         type: 'UNRECOGNIZED_DOCUMENT',
         message: UNRECOGNIZED_PDF_MSG,
       })
-    : auditQuote(excelData, pdfData)
-
-  emit(
-    'audit',
-    `Found ${auditResult.summaryCounts.total} issue(s). Writing analysis…`,
-  )
+    : auditQuote(excelData, pdfData, {
+        pdfText: pdfText.markdown || '',
+      })
 
   const sessionId = crypto.randomUUID()
   const session = {
@@ -176,6 +180,24 @@ export async function runQuoteCheck({
     },
   }
   sessions.set(sessionId, session)
+
+  // Surface findings immediately — do not wait on Sonnet opening analysis.
+  emit(
+    'findings',
+    `Found ${auditResult.summaryCounts.total} issue(s). Writing analysis…`,
+    {
+      sessionId,
+      errors: auditResult.errors,
+      verdict: auditResult.verdict,
+      summaryCounts: auditResult.summaryCounts,
+      analysis: auditResult.analysis,
+      meta: session.meta,
+      warnings,
+      pdfData: {
+        quoteNumber: pdfData.quoteNumber,
+      },
+    },
+  )
 
   let summary = ''
   if (auditResult.analysis?.halted) {
@@ -299,6 +321,7 @@ export function buildQuoteDossier(session) {
       contractDates: excel.contractDates,
       totalResellerCost: excel.totalResellerCost,
       notes: excel.notes || '',
+      paymentSchedule: excel.paymentSchedule || [],
       lineItems: excelLines,
     },
     customerQuote: {
@@ -322,24 +345,84 @@ export function buildQuoteDossier(session) {
       skusInExcelMissingFromPdf: missingFromPdf,
       skusInPdfMissingFromExcel: missingFromExcel,
     },
-    checkFindings: (session?.errors || []).map((e) => ({
-      id: e.id,
-      severity: e.severity,
-      type: e.type,
-      sku: e.sku,
-      page: e.page,
-      message: e.message,
-      locations: e.locations,
-    })),
+    checkFindings: (session?.errors || [])
+      .filter((e) => !e.hidden)
+      .map((e) => ({
+        id: e.id,
+        severity: e.severity,
+        type: e.type,
+        sku: e.sku,
+        page: e.page,
+        message: e.message,
+        locations: e.locations,
+      })),
   }
 }
 
-export async function* streamChat({ sessionId, message, mode = 'chat', errorId = null }) {
+function syncHiddenErrors(session, hiddenErrorIds = []) {
+  const hidden = new Set(
+    (Array.isArray(hiddenErrorIds) ? hiddenErrorIds : [])
+      .map((id) => Number(id))
+      .filter((id) => Number.isFinite(id)),
+  )
+  for (const e of session.errors || []) {
+    e.hidden = hidden.has(Number(e.id))
+  }
+}
+
+export async function* streamChat({
+  sessionId,
+  message,
+  mode = 'chat',
+  errorId = null,
+  hiddenErrorIds = [],
+}) {
   const session = getSession(sessionId)
   if (!session) throw new Error('Check session not found. Upload files again.')
 
-  const error = session.errors.find((e) => e.id === errorId) || null
+  syncHiddenErrors(session, hiddenErrorIds)
+
+  const error =
+    session.errors.find((e) => e.id === errorId && !e.hidden) || null
   const quoteDossier = buildQuoteDossier(session)
+
+  if (mode === 'email') {
+    const scrubSnap = (text) =>
+      String(text || '')
+        .replace(/\bDynamix SNAP\b/gi, 'Dynamix Customer Quote')
+        .replace(/\bSNAP PDF\b/gi, 'customer quote PDF')
+        .replace(/\bin SNAP\b/gi, 'on the customer quote')
+        .replace(/\bon SNAP\b/gi, 'on the customer quote')
+        .replace(/\bSNAP\b/gi, 'customer quote')
+
+    const activeErrors = (session.errors || [])
+      .filter((e) => !e.hidden)
+      .map((e) => ({
+        id: e.id,
+        severity: e.severity,
+        type: e.type,
+        sku: e.sku,
+        page: e.page,
+        message: scrubSnap(e.message),
+        math: e.math,
+      }))
+
+    let full = ''
+    for await (const token of streamEmailDraftWithSonnet({
+      quoteDossier,
+      meta: session.meta,
+      activeErrors,
+      verdict: session.verdict,
+      pdfFileName: session.files?.pdfFilename || '',
+      quoteNumber: session.meta?.customer?.quoteNumber || null,
+    })) {
+      full += token
+      yield token
+    }
+    // Keep draft in session for reuse; do not pollute normal chat turns
+    session.lastEmailDraft = full
+    return
+  }
 
   if (mode === 'quick') {
     const skuKey = String(error?.sku || '').trim().toUpperCase()

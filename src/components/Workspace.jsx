@@ -41,20 +41,39 @@ export default function Workspace({
     lastSwitchedFocusRef.current = errorFocusKey
     const error = errors.find((e) => e.id === activeErrorId && !e.hidden)
     if (!error) return
-    const hasPdf = error.page != null
-    const hasExcel = error.excelRow != null
-    if (hasPdf && !hasExcel) setDocView('pdf')
-    else if (hasExcel && !hasPdf) setDocView('excel')
+    const hasPdf = error.page != null || (error.pdfPages || []).length > 0
+    const hasExcelSheet = Boolean(error.sheetName) || error.excelRow != null
+    // Billing schedule issues live on the PDF — open PDF, not Excel.
+    const isScheduleIssue = /PAYMENT_SCHEDULE|CASH.?FLOW|SCHEDULE_UNBALANCED|PENNY_SCHEDULE/i.test(
+      error.type || '',
+    )
+    // Notes / omitted-terms issues open Excel Notes.
+    const preferExcel =
+      !isScheduleIssue &&
+      (/OMITTED_DISTRIBUTOR|UNCAPTURED_PASSTHROUGH/i.test(error.type || '') ||
+        /notes/i.test(error.sheetName || ''))
+    if (isScheduleIssue && hasPdf) setDocView('pdf')
+    else if (preferExcel && hasExcelSheet) setDocView('excel')
+    else if (hasPdf && !hasExcelSheet) setDocView('pdf')
+    else if (hasExcelSheet && !hasPdf) setDocView('excel')
   }, [errorFocusKey, activeErrorId, errors])
+
+  const hasFindings = (errors || []).length > 0
+  // Keep the chat analysis streaming, but unblock findings as soon as they arrive.
+  const showCheckChrome = isChecking && !hasFindings
 
   return (
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-      {!isChecking && <StatusBanner errors={errors} />}
+      {hasFindings ? (
+        <StatusBanner errors={errors} />
+      ) : null}
       {isChecking && (
         <div className="shrink-0 px-4 py-2.5 bg-brand-secondary text-brand-main flex items-center gap-3 border-b border-brand-main/15">
           <div className="w-4 h-4 rounded-full border-2 border-brand-main/30 border-t-brand-main animate-spin" />
           <div className="text-sm font-medium truncate">
-            {checkStatus || 'Running quote check…'}
+            {hasFindings
+              ? checkStatus || 'Writing analysis…'
+              : checkStatus || 'Running quote check…'}
           </div>
         </div>
       )}
@@ -122,7 +141,7 @@ export default function Workspace({
         </div>
 
         <div className="flex flex-col overflow-hidden w-[35%] min-w-[260px] relative">
-          {isChecking && (
+          {showCheckChrome && (
             <div className="absolute inset-0 z-10 bg-slate-100/70 backdrop-blur-[1px] flex items-center justify-center p-6">
               <div className="text-center space-y-2">
                 <div className="w-8 h-8 mx-auto rounded-full border-2 border-brand-main/20 border-t-brand-main animate-spin" />

@@ -111,14 +111,26 @@ app.post('/api/chat', async (req, res) => {
     req.headers.accept?.includes('text/event-stream')
 
   try {
-    const { sessionId, message, mode = 'chat', errorId = null } = req.body || {}
+    const {
+      sessionId,
+      message,
+      mode = 'chat',
+      errorId = null,
+      hiddenErrorIds = [],
+    } = req.body || {}
     if (!sessionId || !message) {
       return res.status(400).json({ error: 'sessionId and message are required.' })
     }
 
     if (!wantsStream) {
       let answer = ''
-      for await (const token of streamChat({ sessionId, message, mode, errorId })) {
+      for await (const token of streamChat({
+        sessionId,
+        message,
+        mode,
+        errorId,
+        hiddenErrorIds,
+      })) {
         answer += token
       }
       return res.json({ answer, mode })
@@ -129,7 +141,13 @@ app.post('/api/chat', async (req, res) => {
     res.setHeader('Connection', 'keep-alive')
     res.flushHeaders?.()
 
-    for await (const token of streamChat({ sessionId, message, mode, errorId })) {
+    for await (const token of streamChat({
+      sessionId,
+      message,
+      mode,
+      errorId,
+      hiddenErrorIds,
+    })) {
       writeSse(res, 'token', { text: token })
     }
     writeSse(res, 'done', {})

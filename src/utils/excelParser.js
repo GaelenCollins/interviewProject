@@ -4,7 +4,10 @@
  */
 
 import * as XLSX from 'xlsx'
-import { toNumber } from './auditEngine.js'
+import {
+  extractDistributorScheduleFromText,
+  toNumber,
+} from './auditEngine.js'
 import { excelColLetter } from './excelCols.js'
 import {
   detectCurrency,
@@ -21,6 +24,8 @@ import {
  *  lineItems: Array<object>,
  *  totalResellerCost: number|null,
  *  notes: string,
+ *  notesSheetName: string|null,
+ *  paymentSchedule: Array<{ periodLabel: string, cost: number }>,
  *  currency: string|null,
  *  _debug?: object
  * }}
@@ -55,16 +60,25 @@ export function parseDistributorExcel(buffer, filename = '') {
 
   const notesSheet = workbook.SheetNames.find((n) => /notes/i.test(n))
   let notes = ''
+  let notesSheetName = null
+  let noteRows = []
+  let notesLines = []
   if (notesSheet) {
-    const noteRows = XLSX.utils.sheet_to_json(workbook.Sheets[notesSheet], {
+    notesSheetName = notesSheet
+    noteRows = XLSX.utils.sheet_to_json(workbook.Sheets[notesSheet], {
       header: 1,
       defval: '',
     })
-    notes = noteRows
-      .flat()
-      .map(String)
-      .filter(Boolean)
-      .join('\n')
+    notesLines = noteRows
+      .map((row, i) => ({
+        excelRow: i + 1,
+        text: (row || [])
+          .map((c) => String(c ?? '').trim())
+          .filter(Boolean)
+          .join(' '),
+      }))
+      .filter((n) => n.text)
+    notes = notesLines.map((n) => n.text).join('\n')
   }
 
   const dataStart = headerIdx >= 0 ? headerIdx + 1 : 0
@@ -79,6 +93,14 @@ export function parseDistributorExcel(buffer, filename = '') {
 
   const currency = detectCurrency(`${metaBlob}\n${notes}`)
 
+  // Dynamic payment schedule: Notes grid first, then free-text patterns (any N periods).
+  const paymentSchedule = firstNonEmptySchedule(
+    extractPaymentScheduleFromRows(noteRows),
+    extractDistributorScheduleFromText(notes),
+    extractPaymentScheduleFromRows(rows.slice(0, 40)),
+    extractDistributorScheduleFromText(metaBlob),
+  )
+
   return {
     supplierQuoteNumber:
       pick(/Supplier Quote#:\s*([^\n]+)/i) || pick(/Arrow Quote#:\s*([^\n]+)/i),
@@ -90,6 +112,9 @@ export function parseDistributorExcel(buffer, filename = '') {
     lineItems,
     totalResellerCost,
     notes,
+    notesSheetName,
+    notesLines,
+    paymentSchedule,
     currency,
     sheetName,
     _debug: {
@@ -97,8 +122,71 @@ export function parseDistributorExcel(buffer, filename = '') {
       sheetName,
       headerRowIndex: headerIdx,
       headers,
+      paymentScheduleCount: paymentSchedule.length,
     },
   }
+}
+
+function firstNonEmptySchedule(...candidates) {
+  for (const c of candidates) {
+    if (Array.isArray(c) && c.length > 0) return c
+  }
+  return []
+}
+
+/**
+ * Scan sheet rows for period-label + amount pairs (annual / quarterly / monthly / custom).
+ * Returns [] when nothing structured is found.
+ */
+function extractPaymentScheduleFromRows(rows) {
+  if (!Array.isArray(rows) || !rows.length) return []
+
+  const periodCell =
+    /^(?:year|yr\.?|period|installment|payment|q(?:uarter)?|month|mo\.?)(?:\s*#?\s*\d+|[-\s]*[1-4])?$/i
+  const periodLoose =
+    /(?:year|yr\.?|period|installment|payment)\s*#?\s*\d+|q(?:uarter)?\s*[1-4]|month\s*\d+/i
+
+  const found = []
+  const seen = new Set()
+
+  for (const row of rows) {
+    const cells = (row || [])
+      .map((c) => String(c ?? '').trim())
+      .filter((c) => c !== '')
+    if (cells.length < 2) continue
+
+    let label = null
+    let amount = null
+    for (const cell of cells) {
+      if (!label && (periodCell.test(cell) || periodLoose.test(cell))) {
+        label = cell
+        continue
+      }
+      const n = toNumber(cell)
+      if (
+        n != null &&
+        Number.isFinite(n) &&
+        (cell.includes('$') || /[\d,]+\.\d{2}/.test(cell) || n >= 1)
+      ) {
+        // Prefer money-looking cells; skip tiny integers that are likely years alone
+        if (!(label == null && n >= 1900 && n <= 2100 && !cell.includes('$'))) {
+          amount = n
+        }
+      }
+    }
+
+    if (label && amount != null) {
+      const key = `${label.toLowerCase()}|${amount}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      found.push({
+        periodLabel: label,
+        cost: Math.round(amount * 100) / 100,
+      })
+    }
+  }
+
+  return found.length ? found : []
 }
 
 function parseDiscountPercent(rawValue, header = '') {

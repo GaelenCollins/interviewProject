@@ -19,6 +19,7 @@
     "express": "^5.2.1",
     "lucide-react": "^1.27.0",
     "multer": "^2.2.0",
+    "pdf-lib": "^1.17.1",
     "pdfjs-dist": "5.4.296",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

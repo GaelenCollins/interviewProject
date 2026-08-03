@@ -1,7 +1,6 @@
 import { useState } from 'react'
 import { Check, EyeOff, Star } from 'lucide-react'
 import ErrorCard from './ErrorCard'
-import MarginBreakdown from './MarginBreakdown'
 
 export default function ErrorFeed({
   errors,
@@ -18,14 +17,6 @@ export default function ErrorFeed({
   const activeErrors = errors.filter((e) => !e.hidden)
   const ignoredErrors = errors.filter((e) => e.hidden)
   const shown = tab === 'active' ? activeErrors : ignoredErrors
-  const activeError = errors.find((e) => e.id === activeErrorId)
-  const showMarginTable =
-    activeError &&
-    !activeError.hidden &&
-    (activeError.showMarginTable ||
-      /MARGIN|ZERO|NEGATIVE|FLOOR|CEILING|OUTLIER|TARGET_BAND/i.test(
-        activeError.type || '',
-      ))
 
   return (
     <div className="flex flex-col h-full bg-slate-100 border-r border-slate-200">
@@ -69,14 +60,6 @@ export default function ErrorFeed({
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {showMarginTable && tab === 'active' && (
-          <MarginBreakdown
-            analysis={analysis}
-            focusSku={activeError?.sku}
-            meanMarginPercent={meanMarginPercent}
-          />
-        )}
-
         {shown.length === 0 && tab === 'active' && (
           <div className="text-center py-10 space-y-2">
             <div className="flex justify-center">
@@ -107,6 +90,8 @@ export default function ErrorFeed({
             error={error}
             isActive={activeErrorId === error.id}
             isIgnored={tab === 'ignored'}
+            analysis={analysis}
+            meanMarginPercent={meanMarginPercent}
             onSelect={() => onSelectError(error.id)}
             onAction={onAction}
             onIgnore={onIgnore}

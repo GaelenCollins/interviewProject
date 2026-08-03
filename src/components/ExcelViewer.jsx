@@ -6,11 +6,38 @@ import { excelColLetter } from '../utils/excelCols'
 
 const MIN_COL_PX = 40
 const MAX_COL_PX = 480
+const NOTES_MAX_COL_PX = 920
 const DEFAULT_COL_PX = 96
 const ROW_NUM_PX = 40
 const DEFAULT_ROW_PX = 24
 const MIN_ROW_PX = 16
 const MAX_ROW_PX = 120
+const NOTES_MAX_ROW_PX = 280
+
+function resolveSheetName(wanted, names = []) {
+  if (!wanted || !names.length) return null
+  if (names.includes(wanted)) return wanted
+  const lower = String(wanted).toLowerCase()
+  const exactCi = names.find((n) => n.toLowerCase() === lower)
+  if (exactCi) return exactCi
+  return (
+    names.find(
+      (n) =>
+        n.toLowerCase().includes(lower) || lower.includes(n.toLowerCase()),
+    ) || null
+  )
+}
+
+function estimateWrappedRowHeight(text, colWidth, isNotes) {
+  if (!isNotes) return DEFAULT_ROW_PX
+  const t = String(text || '')
+  if (!t) return DEFAULT_ROW_PX
+  const charsPerLine = Math.max(20, Math.floor((colWidth || DEFAULT_COL_PX) / 6.2))
+  const lines = t.split(/\n/).reduce((sum, line) => {
+    return sum + Math.max(1, Math.ceil(line.length / charsPerLine))
+  }, 0)
+  return Math.min(NOTES_MAX_ROW_PX, Math.max(DEFAULT_ROW_PX, lines * 14 + 10))
+}
 
 function colLetterToIndex(letter) {
   if (!letter) return null
@@ -22,22 +49,31 @@ function colLetterToIndex(letter) {
   return n - 1
 }
 
-function measureContentWidths(rows, colCount) {
+function measureContentWidths(rows, colCount, { isNotes = false } = {}) {
   if (typeof document === 'undefined') {
-    return Array.from({ length: colCount }, () => DEFAULT_COL_PX)
+    return Array.from({ length: colCount }, () =>
+      isNotes ? NOTES_MAX_COL_PX : DEFAULT_COL_PX,
+    )
   }
   const canvas = document.createElement('canvas')
   const ctx = canvas.getContext('2d')
   ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace'
+  const maxCap = isNotes ? NOTES_MAX_COL_PX : MAX_COL_PX
   const widths = []
   for (let c = 0; c < colCount; c++) {
     let max = ctx.measureText(excelColLetter(c) || 'A').width
     for (const row of rows) {
       const text = String(row?.[c] ?? '')
       if (!text) continue
-      max = Math.max(max, ctx.measureText(text).width)
+      // Notes: size for readable wrapped blocks, not single-line truncation
+      if (isNotes) {
+        max = Math.max(max, Math.min(maxCap - 22, text.length * 6.2))
+      } else {
+        max = Math.max(max, ctx.measureText(text).width)
+      }
     }
-    widths.push(Math.min(MAX_COL_PX, Math.max(MIN_COL_PX, Math.ceil(max) + 22)))
+    const floor = isNotes ? 360 : MIN_COL_PX
+    widths.push(Math.min(maxCap, Math.max(floor, Math.ceil(max) + 22)))
   }
   return widths
 }
@@ -80,14 +116,21 @@ export default function ExcelViewer({
   const [colWidths, setColWidths] = useState([])
   const [rowHeights, setRowHeights] = useState({})
   const cellRefs = useRef({})
-  const lastFocusKeyRef = useRef(0)
   const dragRef = useRef(null)
+  // Auto-jump sheets once per issue selection; wait for sheetNames to load.
+  // After that jump, never yank the user back if they change sheets.
+  const lastAutoSheetFocusKeyRef = useRef(0)
+  const pendingSheetNavRef = useRef(false)
 
   const visibleErrors = useMemo(
-    () => errors.filter((e) => !e.hidden && e.excelRow != null),
+    () =>
+      errors.filter(
+        (e) => !e.hidden && (e.excelRow != null || e.sheetName),
+      ),
     [errors],
   )
 
+  const isNotesSheet = /notes/i.test(sheetName || '')
   const colCount = Math.max(1, ...rows.map((r) => (r || []).length), 1)
 
   useEffect(() => {
@@ -155,13 +198,22 @@ export default function ExcelViewer({
 
   const sizeColumnsToContent = () => {
     if (!colCount || !rows.length) return
-    setColWidths(measureContentWidths(rows, colCount))
+    setColWidths(measureContentWidths(rows, colCount, { isNotes: isNotesSheet }))
   }
 
   useEffect(() => {
     if (!rows.length || !colCount) return
-    setColWidths(measureContentWidths(rows, colCount))
-  }, [rows, colCount, sheetName])
+    setColWidths(measureContentWidths(rows, colCount, { isNotes: isNotesSheet }))
+    if (isNotesSheet) {
+      const nextHeights = {}
+      const widthHint = NOTES_MAX_COL_PX
+      rows.forEach((row, idx) => {
+        const text = (row || []).map((c) => String(c ?? '')).join(' ')
+        nextHeights[idx] = estimateWrappedRowHeight(text, widthHint, true)
+      })
+      setRowHeights(nextHeights)
+    }
+  }, [rows, colCount, sheetName, isNotesSheet])
 
   useEffect(() => {
     const onMove = (e) => {
@@ -218,10 +270,16 @@ export default function ExcelViewer({
     document.body.style.userSelect = 'none'
   }
 
+  const errorOnActiveSheet = (error) => {
+    if (!error?.sheetName) return true
+    const resolved = resolveSheetName(error.sheetName, sheetNames)
+    return !resolved || resolved === sheetName
+  }
+
   const highlightsByCell = useMemo(() => {
     const map = new Map()
     for (const error of visibleErrors) {
-      if (error.sheetName && sheetName && error.sheetName !== sheetName) continue
+      if (!errorOnActiveSheet(error)) continue
       const rowIdx = Number(error.excelRow) - 1
       const colIdx = colLetterToIndex(error.excelCol)
       if (rowIdx < 0 || colIdx == null) continue
@@ -231,38 +289,84 @@ export default function ExcelViewer({
       map.set(key, prev)
     }
     return map
-  }, [visibleErrors, sheetName])
+  }, [visibleErrors, sheetName, sheetNames])
 
   const rowHighlights = useMemo(() => {
     const map = new Map()
     for (const error of visibleErrors) {
-      if (error.sheetName && sheetName && error.sheetName !== sheetName) continue
+      if (!errorOnActiveSheet(error)) continue
+      // Sheet-level notes issues: highlight all content rows when no specific row
+      if (error.excelRow == null && isNotesSheet) {
+        rows.forEach((row, rowIdx) => {
+          if (!(row || []).some((c) => String(c ?? '').trim())) return
+          const prev = map.get(rowIdx) || []
+          prev.push(error)
+          map.set(rowIdx, prev)
+        })
+        continue
+      }
       const rowIdx = Number(error.excelRow) - 1
       if (rowIdx < 0) continue
       const prev = map.get(rowIdx) || []
       prev.push(error)
       map.set(rowIdx, prev)
+      // Also highlight sibling omitted-term rows when present
+      for (const term of error.omittedTerms || []) {
+        if (term.excelRow == null) continue
+        const tIdx = Number(term.excelRow) - 1
+        if (tIdx < 0) continue
+        const tPrev = map.get(tIdx) || []
+        if (!tPrev.includes(error)) tPrev.push(error)
+        map.set(tIdx, tPrev)
+      }
     }
     return map
-  }, [visibleErrors, sheetName])
+  }, [visibleErrors, sheetName, sheetNames, isNotesSheet, rows])
 
   useEffect(() => {
     if (!errorFocusKey || activeErrorId == null) return
-    if (errorFocusKey === lastFocusKeyRef.current) return
-    lastFocusKeyRef.current = errorFocusKey
-    const error = visibleErrors.find((e) => e.id === activeErrorId)
+    const error = errors.find((e) => e.id === activeErrorId && !e.hidden)
     if (!error) return
-    if (error.sheetName && error.sheetName !== sheetName) {
-      setSheetName(error.sheetName)
+
+    if (errorFocusKey !== lastAutoSheetFocusKeyRef.current) {
+      lastAutoSheetFocusKeyRef.current = errorFocusKey
+      // Defer until sheetNames are available (ExcelViewer may have just remounted).
+      pendingSheetNavRef.current = Boolean(error.sheetName)
+    }
+
+    const targetSheet = resolveSheetName(error.sheetName, sheetNames)
+
+    if (pendingSheetNavRef.current) {
+      if (!sheetNames.length) return // wait for workbook sheets
+      if (targetSheet && targetSheet !== sheetName) {
+        setSheetName(targetSheet)
+        return
+      }
+      // Already on the right sheet (or no resolvable target)
+      pendingSheetNavRef.current = false
+    } else if (targetSheet && targetSheet !== sheetName) {
+      // User manually changed sheets after our jump — leave them alone.
       return
     }
-    const rowIdx = Number(error.excelRow) - 1
-    const colIdx = colLetterToIndex(error.excelCol)
-    const el =
-      (colIdx != null && cellRefs.current[`${rowIdx}:${colIdx}`]) ||
-      cellRefs.current[`row:${rowIdx}`]
-    el?.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' })
-  }, [errorFocusKey, activeErrorId, visibleErrors, sheetName, rows])
+
+    if (!rows.length) return
+
+    const rowIdx =
+      error.excelRow != null
+        ? Number(error.excelRow) - 1
+        : error.omittedTerms?.[0]?.excelRow != null
+          ? Number(error.omittedTerms[0].excelRow) - 1
+          : 0
+    const colIdx = colLetterToIndex(error.excelCol) ?? 0
+
+    const t = window.setTimeout(() => {
+      const el =
+        cellRefs.current[`${rowIdx}:${colIdx}`] ||
+        cellRefs.current[`row:${rowIdx}`]
+      el?.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' })
+    }, 40)
+    return () => window.clearTimeout(t)
+  }, [errorFocusKey, activeErrorId, errors, sheetName, sheetNames, rows])
 
   const tableWidth =
     ROW_NUM_PX + colWidths.reduce((sum, w) => sum + (w || DEFAULT_COL_PX), 0)
@@ -356,7 +460,7 @@ export default function ExcelViewer({
                       ref={(el) => {
                         if (el) cellRefs.current[`row:${rowIdx}`] = el
                       }}
-                      style={{ height: h }}
+                      style={{ height: isNotesSheet ? 'auto' : h, minHeight: h }}
                       className={
                         rowErrors.length
                           ? rowToneClass(true, rowActive)
@@ -375,7 +479,7 @@ export default function ExcelViewer({
                               ? 'bg-slate-50 text-slate-400'
                               : 'bg-white text-slate-400'
                         }`}
-                        style={{ height: h }}
+                        style={{ minHeight: h }}
                       >
                         {rowIdx + 1}
                         <span
@@ -388,8 +492,11 @@ export default function ExcelViewer({
                       {Array.from({ length: colCount }, (_, colIdx) => {
                         const cellKey = `${rowIdx}:${colIdx}`
                         const exact = highlightsByCell.get(cellKey) || []
-                        const active = exact.some((e) => e.id === activeErrorId)
-                        const top = exact[0]
+                        const active =
+                          exact.some((e) => e.id === activeErrorId) ||
+                          (isNotesSheet &&
+                            rowErrors.some((e) => e.id === activeErrorId))
+                        const top = exact[0] || rowErrors[0]
                         const value = row?.[colIdx] ?? ''
                         return (
                           <td
@@ -401,10 +508,18 @@ export default function ExcelViewer({
                               if (exact[0]) onSelectError?.(exact[0].id)
                               else if (rowErrors[0]) onSelectError?.(rowErrors[0].id)
                             }}
-                            style={{ height: h, maxHeight: h }}
-                            className={`relative px-1.5 py-0.5 border border-slate-100 overflow-hidden text-ellipsis whitespace-nowrap align-top ${
-                              exact.length
-                                ? `cursor-pointer ${severityClass(top.severity, active)}`
+                            style={
+                              isNotesSheet
+                                ? { minHeight: h }
+                                : { height: h, maxHeight: h }
+                            }
+                            className={`relative px-1.5 py-0.5 border border-slate-100 align-top ${
+                              isNotesSheet
+                                ? 'whitespace-pre-wrap break-words overflow-visible leading-snug'
+                                : 'overflow-hidden text-ellipsis whitespace-nowrap'
+                            } ${
+                              exact.length || (isNotesSheet && rowErrors.length && active)
+                                ? `cursor-pointer ${severityClass(top?.severity || 'WARNING', active)}`
                                 : rowErrors.length
                                   ? 'cursor-pointer'
                                   : ''
@@ -412,7 +527,9 @@ export default function ExcelViewer({
                             title={
                               exact.length
                                 ? exact.map((e) => `#${e.id} ${e.severity}`).join(' · ')
-                                : String(value)
+                                : isNotesSheet
+                                  ? undefined
+                                  : String(value)
                             }
                           >
                             {String(value)}

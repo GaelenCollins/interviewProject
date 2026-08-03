@@ -442,6 +442,11 @@ function makeError({
   sheetName = null,
   math = null,
   showMarginTable = false,
+  showScheduleTable = false,
+  scheduleComparison = null,
+  omittedTerms = null,
+  detailLines = null,
+  pdfPages = null,
   excelHints = [],
   excelSource = null,
   discountContext = null,
@@ -452,41 +457,41 @@ function makeError({
   const isZeroMargin = /ZERO_OR_NEGATIVE_MARGIN/i.test(type)
   const isReducedMarginFloor = /MARGIN_BELOW_FLOOR/i.test(type)
 
-  // Natural short questions only — model reasons from system prompt + error context.
+  // Natural short questions — always name this finding so chat stays scoped.
+  const issueFocus = [
+    type,
+    sku ? skuLabel(sku) : null,
+    page != null ? `PDF page ${page}` : null,
+  ]
+    .filter(Boolean)
+    .join(' · ')
+
   const actions = [
     {
       label: 'What caused this?',
       kind: 'cause',
-      query: sku
-        ? `What caused the issue on ${skuLabel(sku)}?`
-        : 'What caused this issue?',
+      query: `What caused this specific finding (${issueFocus})? Stay on this issue only.`,
     },
   ]
   if (!isMarginIssue) {
     actions.push({
       label: 'What needs to change?',
       kind: 'fix',
-      query: sku
-        ? `What might need to change for ${skuLabel(sku)}?`
-        : 'What might need to change here?',
+      query: `For this specific finding (${issueFocus}), what might need to change? Stay on this issue only.`,
     })
   }
   if (isMarginIssue) {
     actions.unshift({
       label: 'See margin breakdown',
       kind: 'margins',
-      query: sku
-        ? `Walk me through the margin breakdown for ${skuLabel(sku)}.`
-        : 'Walk me through the margin breakdown.',
+      query: `Walk me through the margin breakdown for this specific finding (${issueFocus}). Stay on this issue only.`,
     })
   }
   if (isZeroMargin || isReducedMarginFloor) {
     actions.push({
       label: 'Margin rebalancing?',
       kind: 'capex_opex',
-      query: sku
-        ? `Could the margin on ${skuLabel(sku)} be intentional rebalancing for the customer?`
-        : 'Could this margin be intentional rebalancing for the customer?',
+      query: `For this specific finding (${issueFocus}), could the margin be intentional rebalancing for the customer? Stay on this issue only.`,
     })
   }
 
@@ -521,8 +526,383 @@ function makeError({
     highlightTerms: terms,
     math,
     showMarginTable,
+    showScheduleTable:
+      showScheduleTable ||
+      Boolean(scheduleComparison?.length) ||
+      /PAYMENT_SCHEDULE|CASH.?FLOW|SCHEDULE_MISMATCH/i.test(type),
+    scheduleComparison,
+    omittedTerms,
+    detailLines,
+    pdfPages: Array.isArray(pdfPages) ? pdfPages.filter((p) => p != null) : null,
     actions,
   }
+}
+
+/** Extra PDF search strings for period labels (Year 1 / Yr 1 / etc.). */
+function periodHighlightTerms(periodLabel) {
+  const label = String(periodLabel || '').trim()
+  if (!label) return []
+  const terms = [label]
+  const num = label.match(/\d+/)?.[0]
+  if (num) {
+    terms.push(`Year ${num}`, `Yr ${num}`, `Yr. ${num}`, `Period ${num}`)
+  }
+  return terms
+}
+
+/**
+ * Collect PDF highlight targets for problem schedule periods.
+ * Returns label/amount pairs so equal dollar amounts on other years are not highlighted.
+ */
+function collectProblemYearPdfTargets(pdfData, focusPeriods = []) {
+  const yearNums = new Set()
+  const periodKeys = new Set()
+  for (const p of focusPeriods) {
+    const key = normalizePeriodKey(p.periodLabel)
+    if (key) periodKeys.add(key)
+    const num = String(p.periodLabel || '').match(/\d+/)?.[0]
+    if (num) yearNums.add(num)
+  }
+
+  /** @type {Map<string, { yearNums: Set<string>, labels: Set<string>, amounts: Set<string> }>} */
+  const pairByYear = new Map()
+  const ensurePair = (yearNum) => {
+    const key = String(yearNum || '')
+    if (!pairByYear.has(key)) {
+      pairByYear.set(key, {
+        yearNums: new Set([key]),
+        labels: new Set(),
+        amounts: new Set(),
+      })
+    }
+    return pairByYear.get(key)
+  }
+
+  const pages = new Set()
+
+  for (const group of pdfData?.groups || []) {
+    const schedulePage = group.schedulePage ?? null
+    for (const entry of group.billingSchedule || []) {
+      const amount = toNumber(
+        typeof entry === 'number' ? entry : entry?.amount ?? entry?.billing,
+      )
+      const label =
+        entry?.periodLabel ||
+        entry?.label ||
+        (entry?.year != null ? `Year ${entry.year}` : '')
+      const yearNum = String(
+        entry?.year ?? String(label).match(/\d+/)?.[0] ?? '',
+      )
+      const key = normalizePeriodKey(label)
+      const isProblem =
+        (yearNum && yearNums.has(yearNum)) ||
+        (key && periodKeys.has(key))
+      if (!isProblem || !yearNum) continue
+
+      const pair = ensurePair(yearNum)
+      for (const t of periodHighlightTerms(label)) pair.labels.add(t)
+      pair.labels.add(`Payment ${yearNum}`)
+      pair.labels.add(`Payment #${yearNum}`)
+      pair.labels.add(`Year ${yearNum}`)
+      if (amount != null) {
+        for (const t of priceSearchTerms(amount)) pair.amounts.add(t)
+      }
+      const entryPage = entry?.page ?? schedulePage
+      if (entryPage != null) pages.add(entryPage)
+      else if (schedulePage != null) pages.add(schedulePage)
+    }
+  }
+
+  // Contribution amounts are per-section Year N payments — pair under that year only
+  for (const p of focusPeriods) {
+    const num = String(p.periodLabel || '').match(/\d+/)?.[0]
+    if (!num) continue
+    const pair = ensurePair(num)
+    for (const t of periodHighlightTerms(p.periodLabel)) pair.labels.add(t)
+    pair.labels.add(`Payment ${num}`)
+    pair.labels.add(`Year ${num}`)
+    for (const c of p.contributions || []) {
+      for (const t of priceSearchTerms(c.amount)) pair.amounts.add(t)
+      if (c.page != null) pages.add(c.page)
+    }
+  }
+
+  let pageList = [...pages].sort((a, b) => a - b)
+  if (pageList.length > 1 && pageList[0] === 1) {
+    const withoutOne = pageList.filter((p) => p !== 1)
+    if (withoutOne.length) pageList = withoutOne
+  }
+
+  const pairs = [...pairByYear.values()].map((p) => ({
+    yearNums: [...p.yearNums],
+    labels: [...p.labels],
+    amounts: [...p.amounts],
+  }))
+
+  // Flat terms kept for fallbacks / non-paired callers (labels first; amounts still paired in UI)
+  const terms = [
+    ...new Set(pairs.flatMap((p) => [...p.labels, ...p.amounts])),
+  ]
+
+  return { terms, pairs, pages: pageList }
+}
+
+/** Normalize period labels for soft matching (Year 1 ≈ Yr 1 ≈ Period 1). */
+export function normalizePeriodKey(label) {
+  const s = String(label || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+  if (!s) return ''
+  const year = s.match(/\b(?:year|yr|period|installment|payment|p)\s*(\d+)\b/)
+  if (year) return `period:${year[1]}`
+  const q = s.match(/\bq(?:uarter)?\s*([1-4])\b/)
+  if (q) return `quarter:${q[1]}`
+  const month = s.match(/\b(?:month|mo)\s*(\d+)\b/)
+  if (month) return `month:${month[1]}`
+  return s
+}
+
+/**
+ * Parse free-text notes / sheet blobs into [{ periodLabel, cost }].
+ * No fixed period count — whatever labels + amounts appear.
+ */
+export function extractDistributorScheduleFromText(text) {
+  const raw = String(text || '')
+  if (!raw.trim()) return []
+
+  const found = []
+  const seen = new Set()
+
+  const push = (periodLabel, costRaw) => {
+    const cost = toNumber(costRaw)
+    if (cost == null || !Number.isFinite(cost)) return
+    const label = String(periodLabel || '').trim()
+    if (!label) return
+    const key = `${normalizePeriodKey(label)}|${toCents(cost)}`
+    if (seen.has(key)) return
+    seen.add(key)
+    found.push({ periodLabel: label, cost: roundMoney(cost) })
+  }
+
+  // Keep matches on the same line — do not let $Amount\nYear N cross-bind.
+  const linePatterns = [
+    {
+      re: /((?:year|yr\.?|period|installment|payment)\s*#?\s*\d+)[ \t]*[:\-–—]?[ \t]*\$?[ \t]*([\d,]+(?:\.\d{1,2})?)/gi,
+      amountFirst: false,
+    },
+    {
+      re: /((?:q(?:uarter)?\s*[1-4]|month\s*\d+|mo\.?\s*\d+))[ \t]*[:\-–—]?[ \t]*\$?[ \t]*([\d,]+(?:\.\d{1,2})?)/gi,
+      amountFirst: false,
+    },
+    {
+      re: /\$[ \t]*([\d,]+(?:\.\d{1,2})?)[ \t]*(?:due|payable|owed)?[ \t]*(?:in|for|on)?[ \t]*((?:year|yr\.?|period|installment|payment)\s*#?\s*\d+)/gi,
+      amountFirst: true,
+    },
+  ]
+
+  for (const line of raw.split(/\n+/)) {
+    for (const { re, amountFirst } of linePatterns) {
+      let m
+      const copy = new RegExp(re.source, re.flags)
+      while ((m = copy.exec(line)) !== null) {
+        if (amountFirst) push(m[2], m[1])
+        else push(m[1], m[2])
+      }
+    }
+  }
+
+  // One entry per normalized period key (first wins)
+  const byKey = new Map()
+  for (const row of found) {
+    const key = normalizePeriodKey(row.periodLabel) || row.periodLabel
+    if (!byKey.has(key)) byKey.set(key, row)
+  }
+  return [...byKey.values()]
+}
+
+/**
+ * Flatten PDF group billing schedules into [{ periodLabel, billing, contributions }].
+ * When multiple quote sections bill the same period, amounts are summed and
+ * each section contribution is retained for the UI addition trail.
+ */
+export function extractCustomerSchedule(pdfData) {
+  const byKey = new Map()
+  let fallbackIndex = 0
+
+  for (const group of pdfData?.groups || []) {
+    const groupTitle = group.groupTitle || 'Untitled section'
+    // Prefer the detail page that holds the Billing Schedule table, not the summary page.
+    const schedulePage =
+      group.schedulePage ??
+      null
+    for (const entry of group.billingSchedule || []) {
+      const billing = toNumber(
+        typeof entry === 'number' ? entry : entry?.amount ?? entry?.billing,
+      )
+      if (billing == null) continue
+      fallbackIndex += 1
+      const periodLabel =
+        entry?.periodLabel ||
+        entry?.label ||
+        (entry?.year != null && Number.isFinite(Number(entry.year))
+          ? `Year ${entry.year}`
+          : `Period ${fallbackIndex}`)
+      const key = normalizePeriodKey(periodLabel) || `idx:${fallbackIndex}`
+      const contribution = {
+        groupTitle,
+        page: entry?.page ?? schedulePage ?? group.page ?? null,
+        amount: roundMoney(billing),
+        periodLabel,
+      }
+      const prev = byKey.get(key)
+      if (prev) {
+        prev.billing = roundMoney(prev.billing + billing)
+        prev.contributions.push(contribution)
+      } else {
+        byKey.set(key, {
+          periodLabel,
+          billing: roundMoney(billing),
+          contributions: [contribution],
+        })
+      }
+    }
+  }
+
+  return [...byKey.values()]
+}
+
+function formatAdditionTrail(contributions = []) {
+  if (!Array.isArray(contributions) || contributions.length < 2) return null
+  const parts = contributions.map(
+    (c) =>
+      `${c.groupTitle || 'Section'}${c.page != null ? ` (p.${c.page})` : ''}: ${formatMoney(c.amount)}`,
+  )
+  const total = roundMoney(
+    contributions.reduce((a, c) => a + (toNumber(c.amount) || 0), 0),
+  )
+  return `${parts.join(' + ')} = ${formatMoney(total)}`
+}
+
+/**
+ * Dynamic period-by-period schedule comparison (length N = max of either side).
+ * No hardcoded years, amounts, or period limits.
+ */
+export function comparePaymentSchedules(
+  distributorSchedule = [],
+  customerSchedule = [],
+) {
+  const dist = Array.isArray(distributorSchedule) ? distributorSchedule : []
+  const cust = Array.isArray(customerSchedule) ? customerSchedule : []
+  const n = Math.max(dist.length, cust.length)
+  if (n === 0) {
+    return {
+      scheduleComparison: [],
+      triggered: false,
+      hasDeficit: false,
+      periodCountMismatch: false,
+    }
+  }
+
+  const scheduleComparison = Array.from({ length: n }, (_, index) => {
+    const distCost = toNumber(dist[index]?.cost) || 0
+    const custBilling = toNumber(cust[index]?.billing) || 0
+    const netCashFlow = roundMoney(custBilling - distCost) ?? 0
+    const periodLabel =
+      dist[index]?.periodLabel ||
+      cust[index]?.periodLabel ||
+      `Period ${index + 1}`
+    const contributions = cust[index]?.contributions || []
+    const wasRolledUp = contributions.length > 1
+    return {
+      periodLabel,
+      distributorCost: roundMoney(distCost) ?? 0,
+      customerBilling: roundMoney(custBilling) ?? 0,
+      netCashFlow,
+      hasDeficit: netCashFlow < -0.05,
+      contributions,
+      wasRolledUp,
+      additionDetail: formatAdditionTrail(contributions),
+    }
+  })
+
+  const hasDeficit = scheduleComparison.some((p) => p.hasDeficit)
+  const periodCountMismatch = dist.length > 0 && cust.length > 0 && dist.length !== cust.length
+  const triggered = hasDeficit || periodCountMismatch
+
+  return {
+    scheduleComparison,
+    triggered,
+    hasDeficit,
+    periodCountMismatch,
+  }
+}
+
+const NOTE_COMPLIANCE_KEYWORDS =
+  /\b(payment|shipment|due|support|license|required|version|billing|net\s*\d+|coterm|renewal)\b/i
+
+/** Pull distinctive tokens from a note line for PDF presence checks. */
+function noteSignatures(line) {
+  const text = String(line || '')
+  const sigs = []
+  const money = text.match(/\$\s*[\d,]+(?:\.\d{2})?/g)
+  if (money) sigs.push(...money.map((m) => m.replace(/\s+/g, '')))
+  const versions = text.match(/\b(?:v(?:ersion)?\s*)?\d+\.\d+(?:\.\d+)?\b/gi)
+  if (versions) sigs.push(...versions)
+  const words = text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(
+      (w) =>
+        w.length >= 5 &&
+        !/^(notes?|please|shall|should|would|could|their|there|these|those|about|after|before|which|where|quote|excel|total)$/.test(
+          w,
+        ),
+    )
+  // Keep a short distinctive phrase of content words
+  if (words.length >= 3) sigs.push(words.slice(0, 6).join(' '))
+  return [...new Set(sigs.map((s) => String(s).toLowerCase().trim()).filter(Boolean))]
+}
+
+/**
+ * Excel Notes → PDF pass-through: flag critical distributor terms omitted from the customer quote.
+ * Returns detailed objects: { text, excelRow, keywords, missingSignatures }.
+ */
+export function findOmittedDistributorNotes(excelNotes, pdfCorpus, notesLines = null) {
+  const corpus = String(pdfCorpus || '').toLowerCase()
+  if (!corpus.trim()) return []
+
+  const candidates = Array.isArray(notesLines) && notesLines.length
+    ? notesLines
+        .map((n) => ({
+          text: String(n.text || n || '').trim(),
+          excelRow: n.excelRow ?? null,
+        }))
+        .filter((n) => n.text.length >= 12 && NOTE_COMPLIANCE_KEYWORDS.test(n.text))
+    : String(excelNotes || '')
+        .split(/\n+/)
+        .map((l, i) => ({ text: l.trim(), excelRow: i + 1 }))
+        .filter((n) => n.text.length >= 12 && NOTE_COMPLIANCE_KEYWORDS.test(n.text))
+
+  const omitted = []
+  for (const line of candidates) {
+    const sigs = noteSignatures(line.text)
+    if (!sigs.length) continue
+    // Fully absent from the customer quote corpus
+    if (!sigs.some((sig) => corpus.includes(sig))) {
+      const keywordHits = [...(line.text.match(new RegExp(NOTE_COMPLIANCE_KEYWORDS.source, 'gi')) || [])]
+        .map((k) => String(k).toLowerCase())
+      omitted.push({
+        text: line.text,
+        excelRow: line.excelRow,
+        keywords: [...new Set(keywordHits)],
+        missingSignatures: sigs,
+      })
+    }
+  }
+  return omitted
 }
 
 function locFromRow(row, colKey = 'sku') {
@@ -621,7 +1001,11 @@ function emptyAnalysis(extra = {}) {
 /**
  * Pre-flight audit: excelData + pdfData → ranked errors + verdict + compared lines.
  */
-export function auditQuote(excelData, pdfData, { asOfDate = todayYmd() } = {}) {
+export function auditQuote(
+  excelData,
+  pdfData,
+  { asOfDate = todayYmd(), pdfText = '' } = {},
+) {
   const errors = []
   const analysis = buildComparedLines(excelData, pdfData)
   const { lines, meanMargin, skuOverlapPercent, matchedSkuCount, pdfSkuCount } =
@@ -668,8 +1052,9 @@ export function auditQuote(excelData, pdfData, { asOfDate = todayYmd() } = {}) {
     })
   }
 
-  // --- CRITICAL ---
+  // --- Line / SKU issues ---
   for (const row of lines) {
+    // All margin issues are WARNING (including 0% / negative).
     if (row.inExcel && row.inPdf && row.unitPrice != null && row.resellerUnitCost != null) {
       if (row.unitPrice <= row.resellerUnitCost || (row.margin != null && row.margin <= 0)) {
         const loc = locFromRow(row, 'resellerUnitCost')
@@ -680,7 +1065,7 @@ export function auditQuote(excelData, pdfData, { asOfDate = todayYmd() } = {}) {
         errors.push(
           makeError({
             type: 'ZERO_OR_NEGATIVE_MARGIN',
-            severity: 'CRITICAL',
+            severity: 'WARNING',
             sku: row.sku,
             line: row.line,
             ...loc,
@@ -693,7 +1078,7 @@ export function auditQuote(excelData, pdfData, { asOfDate = todayYmd() } = {}) {
               marginPercent: row.marginRounded ?? 0,
               meanMarginPercent: roundPct(meanMargin),
             },
-            message: `${skuLabel(row.sku)} sells for ${formatMoney(row.unitPrice)} but reseller cost is ${formatMoney(row.resellerUnitCost)}, so margin is ${marginText}. That usually means a critical pricing error on the ${CUSTOMER_QUOTE}; double-check the SNAP sell price against the Excel cost. ${CAPEX_OPEX_NOTE}`,
+            message: `${skuLabel(row.sku)} sells for ${formatMoney(row.unitPrice)} but reseller cost is ${formatMoney(row.resellerUnitCost)}, so margin is ${marginText}. That usually means a pricing slip on the ${CUSTOMER_QUOTE}; double-check the sell price against the Excel cost. ${CAPEX_OPEX_NOTE} Click for breakdown.`,
           }),
         )
       }
@@ -887,11 +1272,11 @@ export function auditQuote(excelData, pdfData, { asOfDate = todayYmd() } = {}) {
     )
   }
 
-  // --- Margin policy: floor / ceiling / target band (0% already CRITICAL above) ---
+  // --- Margin policy: floor / ceiling / target band (0% / negative already WARNING above) ---
   // Target 8–12%; WARNING <5% or >20%; NOTICE 5–7.9% or 12.1–20%
   for (const row of lines) {
     if (!(row.inExcel && row.inPdf) || row.margin == null) continue
-    if (row.margin <= 0) continue // already CRITICAL
+    if (row.margin <= 0) continue // already WARNING
 
     const marginLabel = `${row.marginRounded ?? roundPct(row.margin)}%`
     const meanLabel = roundPct(meanMargin)
@@ -921,7 +1306,7 @@ export function auditQuote(excelData, pdfData, { asOfDate = todayYmd() } = {}) {
           showMarginTable: true,
           highlightTerms: highlights,
           math,
-          message: `${skuLabel(row.sku)} has a ${marginLabel} margin, under the ${MARGIN_POLICY.FLOOR}% hard floor (target band is ${MARGIN_POLICY.TARGET_MIN}–${MARGIN_POLICY.TARGET_MAX}%). ${CAPEX_OPEX_NOTE}`,
+          message: `${skuLabel(row.sku)} has a ${marginLabel} margin, under the ${MARGIN_POLICY.FLOOR}% hard floor (target band is ${MARGIN_POLICY.TARGET_MIN}–${MARGIN_POLICY.TARGET_MAX}%). ${CAPEX_OPEX_NOTE} Click for breakdown.`,
         }),
       )
     } else if (row.margin > MARGIN_POLICY.CEILING) {
@@ -936,7 +1321,7 @@ export function auditQuote(excelData, pdfData, { asOfDate = todayYmd() } = {}) {
           showMarginTable: true,
           highlightTerms: highlights,
           math,
-          message: `${skuLabel(row.sku)} has a ${marginLabel} margin, above the ${MARGIN_POLICY.CEILING}% hard ceiling (target band is ${MARGIN_POLICY.TARGET_MIN}–${MARGIN_POLICY.TARGET_MAX}%). High margins can risk gouging or losing the bid.`,
+          message: `${skuLabel(row.sku)} has a ${marginLabel} margin, above the ${MARGIN_POLICY.CEILING}% hard ceiling (target band is ${MARGIN_POLICY.TARGET_MIN}–${MARGIN_POLICY.TARGET_MAX}%). High margins can risk gouging or losing the bid. Click for breakdown.`,
         }),
       )
     } else if (
@@ -956,7 +1341,7 @@ export function auditQuote(excelData, pdfData, { asOfDate = todayYmd() } = {}) {
           showMarginTable: true,
           highlightTerms: highlights,
           math,
-          message: `${skuLabel(row.sku)} has a ${marginLabel} margin, ${side} the usual ${MARGIN_POLICY.TARGET_MIN}–${MARGIN_POLICY.TARGET_MAX}% target band (still inside the ${MARGIN_POLICY.FLOOR}–${MARGIN_POLICY.CEILING}% hard limits).`,
+          message: `${skuLabel(row.sku)} has a ${marginLabel} margin, ${side} the usual ${MARGIN_POLICY.TARGET_MIN}–${MARGIN_POLICY.TARGET_MAX}% target band (still inside the ${MARGIN_POLICY.FLOOR}–${MARGIN_POLICY.CEILING}% hard limits). Click for breakdown.`,
         }),
       )
     }
@@ -1024,23 +1409,141 @@ export function auditQuote(excelData, pdfData, { asOfDate = todayYmd() } = {}) {
     }
   }
 
-  // Pass-through fees in notes
+  // --- Dynamic payment schedule / cash-flow audit (Excel ↔ PDF) ---
+  const distributorSchedule =
+    (Array.isArray(excelData.paymentSchedule) && excelData.paymentSchedule.length
+      ? excelData.paymentSchedule
+      : null) ||
+    extractDistributorScheduleFromText(excelData.notes || '')
+  const customerSchedule = extractCustomerSchedule(pdfData)
+  if (distributorSchedule.length > 0 && customerSchedule.length > 0) {
+    const comparison = comparePaymentSchedules(
+      distributorSchedule,
+      customerSchedule,
+    )
+    if (comparison.triggered) {
+      const deficitPeriods = comparison.scheduleComparison.filter((p) => p.hasDeficit)
+      const focusPeriods =
+        deficitPeriods.length > 0
+          ? deficitPeriods
+          : comparison.scheduleComparison
+      const deficitYears = deficitPeriods.map((p) => p.periodLabel)
+      const rolledUp = comparison.scheduleComparison.filter((p) => p.wasRolledUp)
+      const pdfTargets = collectProblemYearPdfTargets(pdfData, focusPeriods)
+      const schedulePage =
+        pdfTargets.pages[0] ??
+        (pdfData.groups || []).find((g) => g.billingSchedule?.length)?.page ??
+        1
+      const totalCost = comparison.scheduleComparison.reduce(
+        (a, p) => a + (p.distributorCost || 0),
+        0,
+      )
+      const totalBilling = comparison.scheduleComparison.reduce(
+        (a, p) => a + (p.customerBilling || 0),
+        0,
+      )
+      // Attach share-of-total % onto each row for the breakdown UI
+      const scheduleComparisonWithShare = comparison.scheduleComparison.map(
+        (p) => ({
+          ...p,
+          distributorSharePercent:
+            totalCost > 0
+              ? roundPct(((p.distributorCost || 0) / totalCost) * 100, 1)
+              : null,
+          customerSharePercent:
+            totalBilling > 0
+              ? roundPct(((p.customerBilling || 0) / totalBilling) * 100, 1)
+              : null,
+        }),
+      )
+      errors.push(
+        makeError({
+          type: 'PAYMENT_SCHEDULE_CASHFLOW',
+          severity: 'CRITICAL',
+          page: schedulePage,
+          pdfPages: pdfTargets.pages.length ? pdfTargets.pages : [schedulePage],
+          // Keep Excel Notes as a secondary location, but navigation prefers PDF.
+          sheetName: excelData.notesSheetName || excelData.sheetName || null,
+          showScheduleTable: true,
+          scheduleComparison: scheduleComparisonWithShare,
+          math: {
+            periodCount: scheduleComparisonWithShare.length,
+            hasDeficit: comparison.hasDeficit,
+            periodCountMismatch: comparison.periodCountMismatch,
+            deficitPeriods: deficitYears,
+            rolledUpPeriods: rolledUp.map((p) => p.periodLabel),
+            cumulativeDistributorCost: roundMoney(totalCost),
+            cumulativeCustomerBilling: roundMoney(totalBilling),
+          },
+          highlightTerms: pdfTargets.terms,
+          message:
+            'Payment Schedule / Cash-Flow Discrepancy. The customer billing schedule does not align with the distributor payment terms. One or more periods create a negative net cash-flow position for Dynamix before profit is recovered in later installments. Click for breakdown.',
+        }),
+      )
+    }
+  }
+
+  // Pass-through / omitted distributor notes (Excel Notes → PDF)
   const notes = String(excelData.notes || '')
+  const pdfCorpus = [
+    pdfText,
+    JSON.stringify(pdfData || {}),
+    ...(pdfData.groups || []).flatMap((g) => [
+      g.groupTitle,
+      ...(g.billingSchedule || []).map((b) =>
+        [b.periodLabel, b.label, b.year, b.amount].filter(Boolean).join(' '),
+      ),
+    ]),
+  ].join('\n')
+
   const feeMatch = notes.match(/\$\s*(\d+(?:\.\d{2})?)\s*per\s+appliance/i)
   if (feeMatch) {
     const fee = toNumber(feeMatch[1])
-    const pdfBlob = JSON.stringify(pdfData)
-    if (fee != null && !pdfBlob.includes(String(fee)) && !/\$200\b/.test(pdfBlob)) {
+    if (
+      fee != null &&
+      !pdfCorpus.includes(String(fee)) &&
+      !new RegExp(`\\$${fee}\\b`).test(pdfCorpus)
+    ) {
       errors.push(
         makeError({
           type: 'UNCAPTURED_PASSTHROUGH_FEE',
           severity: 'WARNING',
           page: 1,
-          sheetName: excelData.sheetName ?? null,
+          sheetName: excelData.notesSheetName || excelData.sheetName || null,
           message: `${DISTRIBUTOR_QUOTE} Notes call for about $${fee} shipping per appliance, and that does not show up on the ${CUSTOMER_QUOTE}.`,
         }),
       )
     }
+  }
+
+  const omittedNotes = findOmittedDistributorNotes(
+    notes,
+    pdfCorpus,
+    excelData.notesLines || null,
+  )
+  if (omittedNotes.length > 0) {
+    const firstRow =
+      omittedNotes.find((n) => n.excelRow != null)?.excelRow ?? null
+    const count = omittedNotes.length
+    errors.push(
+      makeError({
+        type: 'OMITTED_DISTRIBUTOR_NOTE',
+        severity: 'WARNING',
+        page: null,
+        sheetName: excelData.notesSheetName || 'Notes',
+        excelRow: firstRow,
+        excelCol: 'A',
+        omittedTerms: omittedNotes,
+        detailLines: omittedNotes.map((n) => n.text),
+        math: {
+          omittedCount: count,
+        },
+        message:
+          count === 1
+            ? 'Distributor Notes call out a billing or compliance term that did not make it onto the customer PDF. Click for breakdown.'
+            : `Distributor Notes call out ${count} billing or compliance terms that did not make it onto the customer PDF. Click for breakdown.`,
+      }),
+    )
   }
 
   // NOTICE: formatting cleanup
