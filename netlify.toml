@@ -10,6 +10,10 @@
 
 [build.environment]
   NODE_VERSION = "22"
+  # VITE_* values are public by design and appear in the JS bundle.
+  # Omit them so secrets scanning does not fail the deploy.
+  SECRETS_SCAN_OMIT_KEYS = "VITE_API_BASE_URL"
+  SECRETS_SCAN_OMIT_PATHS = ".env.example"
 
 # Optional: reverse-proxy /api to your API host instead of using
 # VITE_API_BASE_URL. Uncomment and set the destination:
