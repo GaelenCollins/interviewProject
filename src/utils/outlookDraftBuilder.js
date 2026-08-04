@@ -1,6 +1,7 @@
 /**
- * Client-side RFC 822 (.eml) builder for Outlook drafts with annotated PDF attachment.
- * mailto: cannot attach files — opening .eml launches Outlook with body + attachment.
+ * Client-side RFC 822 (.eml) builder for Outlook drafts with attachments
+ * (annotated PDF + original Excel distributor quote).
+ * mailto: cannot attach files — opening .eml launches Outlook with body + attachments.
  */
 
 import {
@@ -115,13 +116,32 @@ export function generateDeterministicEmail({
   section('Notices', notices)
 
   lines.push(
-    'I attached an annotated PDF that marks up the findings on the customer quote.',
+    'I attached an annotated PDF that marks up the findings on the customer quote, plus the original distributor Excel for reference.',
   )
   lines.push('')
   lines.push('Thanks,')
   lines.push('[Your Name]')
 
   return lines.join('\n')
+}
+
+function excelMimeType(fileName = '', contentType = '') {
+  const typed = String(contentType || '').trim()
+  if (typed && typed !== 'application/octet-stream') return typed
+  const name = String(fileName || '').toLowerCase()
+  if (name.endsWith('.xlsx')) {
+    return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  }
+  if (name.endsWith('.xls')) return 'application/vnd.ms-excel'
+  if (name.endsWith('.csv')) return 'text/csv'
+  return 'application/octet-stream'
+}
+
+function sanitizeAttachmentName(name, fallback) {
+  const raw = String(name || fallback || 'attachment')
+    .replace(/[\r\n"]+/g, '_')
+    .trim()
+  return raw || fallback || 'attachment'
 }
 
 /**
@@ -148,14 +168,14 @@ export function resolveEmailBody({
   // Else use latest substantive check summary (skip short status lines)
   const summary = assistants.find((m) => String(m.text).trim().length > 80)
   if (summary) {
-    return `${String(summary.text).trim()}\n\nI have attached an annotated PDF with highlights for the active findings.\n\nThanks,`
+    return `${String(summary.text).trim()}\n\nI attached an annotated PDF with highlights for the active findings, plus the original distributor Excel for reference.\n\nThanks,`
   }
 
   return generateDeterministicEmail({ errors, pdfFileName, quoteNumber })
 }
 
 /**
- * Build a message/rfc822 Blob for Outlook (X-Unsent draft + PDF attachment).
+ * Build a message/rfc822 Blob for Outlook (X-Unsent draft + attachments).
  */
 export async function buildOutlookDraft({
   to = '',
@@ -164,13 +184,19 @@ export async function buildOutlookDraft({
   pdfArrayBuffer,
   auditResults = {},
   fileName = 'customer_quote.pdf',
+  excelArrayBuffer = null,
+  excelFileName = '',
+  excelContentType = '',
 } = {}) {
   if (!pdfArrayBuffer) {
     throw new Error('PDF file is required to build an Outlook draft.')
   }
 
   const annotatedBytes = await generateAnnotatedPdf(pdfArrayBuffer, auditResults)
-  const attachmentName = buildAnnotatedFilename(fileName)
+  const pdfAttachmentName = sanitizeAttachmentName(
+    buildAnnotatedFilename(fileName),
+    'annotated_quote.pdf',
+  )
   const pdfBase64 = foldBase64(uint8ToBase64(annotatedBytes))
 
   const boundary = `----=_Part_Dynamix_${Date.now().toString(36)}_${Math.random()
@@ -183,7 +209,7 @@ export async function buildOutlookDraft({
     scrubSnapFromEmailText(subject || 'Quote check findings'),
   )
 
-  const eml = [
+  const parts = [
     'MIME-Version: 1.0',
     'X-Unsent: 1',
     toHeader ? `To: ${toHeader}` : 'To: ',
@@ -198,16 +224,37 @@ export async function buildOutlookDraft({
     body,
     '',
     `--${boundary}`,
-    `Content-Type: application/pdf; name="${attachmentName}"`,
+    `Content-Type: application/pdf; name="${pdfAttachmentName}"`,
     'Content-Transfer-Encoding: base64',
-    `Content-Disposition: attachment; filename="${attachmentName}"`,
+    `Content-Disposition: attachment; filename="${pdfAttachmentName}"`,
     '',
     pdfBase64,
-    `--${boundary}--`,
-    '',
-  ].join('\r\n')
+  ]
 
-  return new Blob([eml], { type: 'message/rfc822' })
+  if (excelArrayBuffer) {
+    const excelName = sanitizeAttachmentName(
+      excelFileName,
+      'distributor_quote.xlsx',
+    )
+    const excelType = excelMimeType(excelName, excelContentType)
+    const excelBytes =
+      excelArrayBuffer instanceof Uint8Array
+        ? excelArrayBuffer
+        : new Uint8Array(excelArrayBuffer)
+    const excelBase64 = foldBase64(uint8ToBase64(excelBytes))
+    parts.push(
+      `--${boundary}`,
+      `Content-Type: ${excelType}; name="${excelName}"`,
+      'Content-Transfer-Encoding: base64',
+      `Content-Disposition: attachment; filename="${excelName}"`,
+      '',
+      excelBase64,
+    )
+  }
+
+  parts.push(`--${boundary}--`, '')
+
+  return new Blob([parts.join('\r\n')], { type: 'message/rfc822' })
 }
 
 /** Trigger a browser download of the .eml draft (user opens it in Outlook). */

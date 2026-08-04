@@ -60,7 +60,7 @@ If something is truly absent from quoteDossier, say exactly what field is missin
 Ignored findings: checkFindings only lists active (non-ignored) issues. Never mention, summarize, or draft emails about ignored or hidden issues — even if they appeared earlier in the chat history or opening summary. Treat ignored issues as out of scope unless the user explicitly asks about a specific ignored item.`
 
 const APP_CAPABILITIES = `App capabilities (tell the user accurately how to use them — never invent missing features or deny real ones):
-- Email report with attachment: the header email button (and typing a request like "email this to my boss") downloads a .eml draft that includes an annotated PDF of active findings. The user opens that file in their email app, adds the recipient, and sends. The app does not transmit email itself.
+- Email report with attachments: the header email button (and typing a request like "email this to my boss") downloads a .eml draft that includes an annotated PDF of active findings plus the original distributor Excel (unmodified). The user opens that file in their email app, adds the recipient, and sends. The app does not transmit email itself.
 - Annotated PDF: PDF viewer toolbar "Export Annotated PDF" downloads a marked-up customer quote for the active findings.
 - Calculator: header calculator icon opens Sale Price / Margin % / scientific calculator tools.
 - Issues panel: click a finding to jump to PDF/Excel highlights; use Critical/Warning/Notice checkboxes to filter; Hide/Ignore removes an issue from the active list and from email drafts.
@@ -536,7 +536,7 @@ Hard rules:
 - Cover only the active findings provided. Never invent SKUs, prices, or issues.
 - Do not mention this app, the chatbot, Calculator, tabs, buttons, ignore/hide, or any in-product tooling.
 - Do not mention SNAP at all.
-- You may refer to the customer quote PDF / Dynamix Customer Quote and the distributor Excel quote as business files, and note that an annotated PDF is attached.
+- You may refer to the customer quote PDF / Dynamix Customer Quote and the distributor Excel quote as business files, and note that an annotated PDF and the original Excel are attached.
 - Soft language only (should / could / probably). No must / will block.
 - Low margin = Dynamix profitability concern. High margin = customer/bid concern.
 - Keep it professional and concise (about half a page). Plain text only: no markdown bold, no bullet asterisks for bold, no emojis.`,

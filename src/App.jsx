@@ -399,11 +399,14 @@ export default function App() {
       setEmailExport({
         phase: 'building',
         progress: 70,
-        message: 'Building annotated PDF and download…',
+        message: excelFile
+          ? 'Building annotated PDF, attaching Excel, and preparing download…'
+          : 'Building annotated PDF and download…',
         fileName: downloadName,
       })
 
       const pdfArrayBuffer = await pdfFile.arrayBuffer()
+      const excelArrayBuffer = excelFile ? await excelFile.arrayBuffer() : null
       const blob = await buildOutlookDraft({
         to: '',
         subject,
@@ -414,6 +417,9 @@ export default function App() {
           verdict: computeVerdict(activeErrors),
         },
         fileName: pdfName,
+        excelArrayBuffer,
+        excelFileName: excelFile?.name || 'distributor_quote.xlsx',
+        excelContentType: excelFile?.type || '',
       })
 
       downloadOutlookDraft(blob, downloadName)
@@ -434,7 +440,7 @@ export default function App() {
     } finally {
       emailExportBusy.current = false
     }
-  }, [pdfFile, errors, sessionId, quoteNumber])
+  }, [pdfFile, excelFile, errors, sessionId, quoteNumber])
 
   const emailBannerTone =
     emailExport?.phase === 'error'
