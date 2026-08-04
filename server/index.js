@@ -12,7 +12,49 @@ const upload = multer({
   limits: { fileSize: MAX_FILE_BYTES },
 })
 
-app.use(cors())
+function parseOriginList(value) {
+  return String(value || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+}
+
+/** Local Vite + any Netlify / custom frontend origins from env. */
+const corsAllowedOrigins = new Set([
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'http://localhost:8443',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:8443',
+  ...parseOriginList(process.env.CORS_ORIGINS),
+  ...parseOriginList(process.env.FRONTEND_URL),
+])
+
+function isAllowedCorsOrigin(origin) {
+  if (!origin) return true
+  if (corsAllowedOrigins.has(origin)) return true
+  try {
+    const { hostname } = new URL(origin)
+    // Netlify production + deploy previews (*.netlify.app)
+    if (hostname === 'netlify.app' || hostname.endsWith('.netlify.app')) {
+      return true
+    }
+  } catch {
+    return false
+  }
+  return false
+}
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (isAllowedCorsOrigin(origin)) return callback(null, true)
+      console.warn(`[cors] blocked origin: ${origin}`)
+      return callback(null, false)
+    },
+  }),
+)
 app.use(express.json({ limit: '2mb' }))
 
 function writeSse(res, event, data) {
@@ -163,7 +205,7 @@ app.post('/api/chat', async (req, res) => {
   }
 })
 
-const port = Number(process.env.API_PORT || process.env.PORT || 8787)
+const port = Number(process.env.API_PORT || process.env.PORT || 3001)
 app.listen(port, () => {
   console.log(`[quote-checker-api] listening on http://localhost:${port}`)
   console.log(`[quote-checker-api] Haiku=${MODELS.HAIKU} Sonnet=${MODELS.SONNET}`)

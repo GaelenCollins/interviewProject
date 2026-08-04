@@ -1,0 +1,27 @@
+# Netlify — Vite SPA frontend.
+# Quote-check / chat / email still need a separate Node API host
+# (Railway, Render, Fly, etc.). Set VITE_API_BASE_URL in Netlify
+# to that origin (e.g. https://your-backend.onrender.com) so /api calls
+# reach the Express server. Do NOT put ANTHROPIC_API_KEY in VITE_*.
+
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "22"
+
+# Optional: reverse-proxy /api to your API host instead of using
+# VITE_API_BASE_URL. Uncomment and set the destination:
+#
+# [[redirects]]
+#   from = "/api/*"
+#   to = "https://YOUR-API-HOST/api/:splat"
+#   status = 200
+#   force = true
+
+# SPA fallback (must stay after any /api proxy rules)
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

@@ -1,4 +1,36 @@
+const API_BASE_URL = (
+  import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001'
+).replace(/\/$/, '')
+
+function apiUrl(path) {
+  const normalized = path.startsWith('/') ? path : `/${path}`
+  return `${API_BASE_URL}${normalized}`
+}
+
+function missingApiConfigMessage() {
+  return (
+    'API is not reachable. On Netlify, set VITE_API_BASE_URL to your Render/Railway ' +
+    'API origin (e.g. https://your-backend.onrender.com). Locally the app expects ' +
+    'the Express API on http://localhost:3001. Keep ANTHROPIC_API_KEY on the API host only.'
+  )
+}
+
+async function assertApiResponse(res) {
+  const contentType = res.headers.get('content-type') || ''
+  // Netlify SPA fallback returns index.html with 200 for unknown /api routes
+  if (contentType.includes('text/html')) {
+    throw new Error(
+      `API at ${API_BASE_URL} returned HTML instead of JSON/SSE (${res.status}). ` +
+        (import.meta.env.VITE_API_BASE_URL
+          ? 'Check the API URL and CORS allowlist on the backend.'
+          : missingApiConfigMessage()),
+    )
+  }
+  return res
+}
+
 async function parseJson(res) {
+  await assertApiResponse(res)
   const data = await res.json().catch(() => ({}))
   if (!res.ok) {
     throw new Error(data.error || `Request failed (${res.status})`)
@@ -7,9 +39,19 @@ async function parseJson(res) {
 }
 
 async function readSse(res, handlers) {
+  await assertApiResponse(res)
+
   if (!res.ok) {
     const data = await res.json().catch(() => ({}))
     throw new Error(data.error || `Request failed (${res.status})`)
+  }
+
+  if (!res.body) {
+    throw new Error(
+      import.meta.env.VITE_API_BASE_URL
+        ? 'API stream body was empty. Check that the API supports SSE.'
+        : missingApiConfigMessage(),
+    )
   }
 
   const reader = res.body.getReader()
@@ -45,7 +87,7 @@ export async function runCheckStream({ pdfFile, excelFile, onProgress, onResult 
   form.append('pdf', pdfFile)
   form.append('excel', excelFile)
 
-  const res = await fetch('/api/check?stream=1', {
+  const res = await fetch(apiUrl('/api/check?stream=1'), {
     method: 'POST',
     body: form,
     headers: { Accept: 'text/event-stream' },
@@ -78,7 +120,7 @@ export async function sendChatStream({
   hiddenErrorIds = [],
   onToken,
 }) {
-  const res = await fetch('/api/chat?stream=1', {
+  const res = await fetch(apiUrl('/api/chat?stream=1'), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -120,6 +162,6 @@ export async function streamEmailDraft({
 }
 
 export async function getHealth() {
-  const res = await fetch('/api/health')
+  const res = await fetch(apiUrl('/api/health'))
   return parseJson(res)
 }
