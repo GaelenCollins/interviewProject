@@ -1,6 +1,11 @@
-const API_BASE_URL = (
-  import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001'
-).replace(/\/$/, '')
+/**
+ * - Local Vite (`import.meta.env.DEV`): empty base → `/api/*` via Vite proxy → Express :3001
+ * - Netlify / production: set VITE_API_BASE_URL=https://interviewprojectapi.onrender.com
+ */
+const API_BASE_URL = String(import.meta.env.VITE_API_BASE_URL || '').replace(
+  /\/$/,
+  '',
+)
 
 function apiUrl(path) {
   const normalized = path.startsWith('/') ? path : `/${path}`
@@ -8,11 +13,25 @@ function apiUrl(path) {
 }
 
 function missingApiConfigMessage() {
+  if (import.meta.env.DEV) {
+    return (
+      'Cannot reach the local API. Run `pnpm dev` (or `pnpm dev:api`) so Express is ' +
+      'listening on http://localhost:3001, and keep the Vite app on :8443.'
+    )
+  }
   return (
-    'API is not reachable. On Netlify, set VITE_API_BASE_URL to your Render/Railway ' +
-    'API origin (e.g. https://your-backend.onrender.com). Locally the app expects ' +
-    'the Express API on http://localhost:3001. Keep ANTHROPIC_API_KEY on the API host only.'
+    'API is not reachable. On Netlify, set VITE_API_BASE_URL to your Render API ' +
+    'origin (e.g. https://interviewprojectapi.onrender.com) and redeploy. ' +
+    'Keep ANTHROPIC_API_KEY on Render only.'
   )
+}
+
+async function fetchApi(path, init) {
+  try {
+    return await fetch(apiUrl(path), init)
+  } catch {
+    throw new Error(missingApiConfigMessage())
+  }
 }
 
 async function assertApiResponse(res) {
@@ -20,10 +39,9 @@ async function assertApiResponse(res) {
   // Netlify SPA fallback returns index.html with 200 for unknown /api routes
   if (contentType.includes('text/html')) {
     throw new Error(
-      `API at ${API_BASE_URL} returned HTML instead of JSON/SSE (${res.status}). ` +
-        (import.meta.env.VITE_API_BASE_URL
-          ? 'Check the API URL and CORS allowlist on the backend.'
-          : missingApiConfigMessage()),
+      API_BASE_URL
+        ? `API at ${API_BASE_URL} returned HTML instead of JSON/SSE (${res.status}). Check the API URL and CORS.`
+        : missingApiConfigMessage(),
     )
   }
   return res
@@ -48,7 +66,7 @@ async function readSse(res, handlers) {
 
   if (!res.body) {
     throw new Error(
-      import.meta.env.VITE_API_BASE_URL
+      API_BASE_URL
         ? 'API stream body was empty. Check that the API supports SSE.'
         : missingApiConfigMessage(),
     )
@@ -87,7 +105,7 @@ export async function runCheckStream({ pdfFile, excelFile, onProgress, onResult 
   form.append('pdf', pdfFile)
   form.append('excel', excelFile)
 
-  const res = await fetch(apiUrl('/api/check?stream=1'), {
+  const res = await fetchApi('/api/check?stream=1', {
     method: 'POST',
     body: form,
     headers: { Accept: 'text/event-stream' },
@@ -120,7 +138,7 @@ export async function sendChatStream({
   hiddenErrorIds = [],
   onToken,
 }) {
-  const res = await fetch(apiUrl('/api/chat?stream=1'), {
+  const res = await fetchApi('/api/chat?stream=1', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -162,6 +180,6 @@ export async function streamEmailDraft({
 }
 
 export async function getHealth() {
-  const res = await fetch(apiUrl('/api/health'))
+  const res = await fetchApi('/api/health')
   return parseJson(res)
 }

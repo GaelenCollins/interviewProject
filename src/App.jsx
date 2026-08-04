@@ -459,11 +459,11 @@ export default function App() {
 
       {emailExport ? (
         <div
-          className={`shrink-0 border-b px-5 py-2.5 ${emailBannerTone}`}
+          className={`shrink-0 border-b px-3 md:px-5 py-1.5 md:py-2.5 ${emailBannerTone}`}
           role="status"
         >
-          <div className="flex items-center justify-between gap-3 mb-1.5">
-            <p className="text-xs font-medium leading-snug">
+          <div className="flex items-center justify-between gap-3 mb-1 md:mb-1.5">
+            <p className="text-[11px] md:text-xs font-medium leading-snug line-clamp-2 md:line-clamp-none">
               {emailExport.message}
             </p>
             {emailExport.phase === 'done' || emailExport.phase === 'error' ? (
@@ -529,13 +529,13 @@ export default function App() {
           exportRequestKey={exportRequestKey}
         />
       ) : (
-        <div className="flex-1 flex overflow-hidden">
+        <div className="flex-1 flex flex-col md:flex-row overflow-hidden min-h-0">
           <FileUpload
             onFilesReady={handleFilesReady}
             isChecking={isChecking}
             checkError={checkError}
           />
-          <div className="flex flex-col overflow-hidden shrink-0 w-[260px]">
+          <div className="flex flex-col overflow-hidden shrink-0 w-full md:w-[260px] h-[40%] md:h-auto border-t md:border-t-0 border-white/10">
             <AiAssistant
               messages={chatMessages}
               onSend={handleSendChat}

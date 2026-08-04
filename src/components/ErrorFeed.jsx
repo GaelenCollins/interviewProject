@@ -68,12 +68,12 @@ export default function ErrorFeed({
 
   return (
     <div className="flex flex-col h-full bg-slate-100 border-r border-slate-200">
-      <div className="shrink-0 px-4 py-3 bg-white border-b border-slate-200 space-y-2.5">
+      <div className="shrink-0 px-3 md:px-4 py-2 md:py-3 bg-white border-b border-slate-200 space-y-2">
         <div className="flex items-center justify-between gap-2">
           <button
             type="button"
             onClick={() => setTab('active')}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-semibold border transition-all ${
+            className={`inline-flex items-center gap-1.5 px-2.5 md:px-3 py-1 md:py-1.5 rounded-lg text-xs md:text-sm font-semibold border transition-all ${
               tab === 'active'
                 ? activeErrors.some((e) => e.severity === 'CRITICAL')
                   ? 'bg-brand-acc1/[0.10] text-brand-acc1 border-brand-acc1/40 shadow-sm'
@@ -84,20 +84,22 @@ export default function ErrorFeed({
             }`}
           >
             <Star className="w-3.5 h-3.5" strokeWidth={2} />
-            {activeErrors.length} issue{activeErrors.length !== 1 ? 's' : ''} found
+            {activeErrors.length} issue{activeErrors.length !== 1 ? 's' : ''}
+            <span className="hidden md:inline"> found</span>
           </button>
 
           <button
             type="button"
             onClick={() => setTab('ignored')}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-all ${
+            className={`inline-flex items-center gap-1.5 px-2.5 md:px-3 py-1 md:py-1.5 rounded-lg text-[11px] md:text-xs font-medium border transition-all ${
               tab === 'ignored'
                 ? 'bg-brand-main text-white border-brand-main shadow-sm'
                 : 'bg-white text-brand-main border-slate-200 hover:bg-slate-50'
             }`}
           >
             <EyeOff className="w-3.5 h-3.5" strokeWidth={2} />
-            Ignored Errors
+            <span className="md:hidden">Ignored</span>
+            <span className="hidden md:inline">Ignored Errors</span>
             {ignoredErrors.length > 0 && (
               <span className="min-w-[1.25rem] h-5 px-1 rounded-full text-[10px] font-bold inline-flex items-center justify-center bg-slate-200 text-slate-600">
                 {ignoredErrors.length}
@@ -107,8 +109,8 @@ export default function ErrorFeed({
         </div>
 
         {tab === 'active' && activeErrors.length > 0 && (
-          <div className="flex flex-wrap items-center gap-3">
-            <span className="text-[10px] font-medium text-slate-400">
+          <div className="flex flex-wrap items-center gap-2 md:gap-3">
+            <span className="hidden md:inline text-[10px] font-medium text-slate-400">
               Filter by severity
             </span>
             {SEVERITY_FILTERS.map((f) => {

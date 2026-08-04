@@ -46,17 +46,17 @@ export default function AiAssistant({
 
   return (
     <div className="flex flex-col h-full bg-white border-l border-slate-200">
-      <div className="px-4 py-3 shrink-0 border-b border-slate-100">
-        <div className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full font-semibold text-sm bg-brand-acc2 text-[#1a1a00]">
+      <div className="px-3 md:px-4 py-2 md:py-3 shrink-0 border-b border-slate-100">
+        <div className="inline-flex items-center gap-1.5 px-2.5 md:px-3 py-1 md:py-1.5 rounded-full font-semibold text-xs md:text-sm bg-brand-acc2 text-[#1a1a00]">
           AI Assistant
         </div>
-        <div className="text-xs mt-1.5 text-slate-400">
+        <div className="hidden md:block text-xs mt-1.5 text-slate-400">
           {isChecking
             ? statusLine || 'Working through your files…'
             : 'Ask anything about this quote check'}
         </div>
         {isChecking && (
-          <div className="mt-2 h-1 rounded-full bg-slate-100 overflow-hidden">
+          <div className="mt-1.5 md:mt-2 h-1 rounded-full bg-slate-100 overflow-hidden">
             <div className="h-full w-1/3 bg-brand-acc2 animate-pulse rounded-full" />
           </div>
         )}

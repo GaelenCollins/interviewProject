@@ -77,8 +77,8 @@ export default function PaymentScheduleBreakdown({
         </div>
       </div>
 
-      <div className="overflow-x-auto max-h-56 overflow-y-auto">
-        <table className="w-full text-[10px] border-collapse">
+      <div className="overflow-x-auto -mx-3 px-3 max-h-56 overflow-y-auto touch-pan-x">
+        <table className="w-full min-w-[520px] text-[10px] border-collapse">
           <thead className="sticky top-0 bg-slate-50">
             <tr className="text-left text-slate-500">
               <th className="py-1.5 pr-2 font-medium">Period / Year</th>

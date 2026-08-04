@@ -1,8 +1,8 @@
-# Netlify — Vite SPA frontend.
-# Quote-check / chat / email still need a separate Node API host
-# (Railway, Render, Fly, etc.). Set VITE_API_BASE_URL in Netlify
-# to that origin (e.g. https://your-backend.onrender.com) so /api calls
-# reach the Express server. Do NOT put ANTHROPIC_API_KEY in VITE_*.
+# Netlify — Vite SPA frontend only.
+# Set ONLY: VITE_API_BASE_URL=https://interviewprojectapi.onrender.com
+# Do NOT set ANTHROPIC_API_KEY / CLAUDE_* / API_PORT here — those belong
+# on Render. Keeping ANTHROPIC_API_KEY in Netlify makes secrets scanning
+# fail the build even though the key is unused by the Vite bundle.
 
 [build]
   command = "npm run build"

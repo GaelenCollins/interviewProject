@@ -616,18 +616,18 @@ export default function MarginCalculatorModal({ onClose }) {
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/55"
+      className="fixed inset-0 z-50 flex items-stretch md:items-center justify-center bg-black/55 md:p-4"
       onClick={onClose}
       role="presentation"
     >
       <div
-        className="rounded-2xl shadow-2xl w-[420px] max-h-[90vh] overflow-y-auto bg-white border-2 border-brand-secondary"
+        className="w-full h-full md:h-auto md:max-h-[90vh] md:w-[420px] md:max-w-2xl md:rounded-2xl shadow-2xl overflow-y-auto bg-white border-0 md:border-2 border-brand-secondary"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
         aria-labelledby="calc-title"
       >
-        <div className="flex items-center justify-between px-5 py-4 rounded-t-2xl bg-brand-main sticky top-0 z-10">
+        <div className="flex items-center justify-between px-5 py-4 md:rounded-t-2xl bg-brand-main sticky top-0 z-10">
           <div className="flex items-center gap-2">
             <Calculator className="w-4.5 h-4.5 text-brand-secondary" />
             <span id="calc-title" className="font-semibold text-white text-[15px]">
@@ -637,7 +637,7 @@ export default function MarginCalculatorModal({ onClose }) {
           <button
             type="button"
             onClick={onClose}
-            className="text-white/60 hover:text-white transition-colors"
+            className="min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center text-white/60 hover:text-white transition-colors"
             aria-label="Close calculator"
           >
             <X className="w-5 h-5" />
@@ -651,7 +651,7 @@ export default function MarginCalculatorModal({ onClose }) {
                 key={t.id}
                 type="button"
                 onClick={() => setTab(t.id)}
-                className={`px-2 py-1.5 rounded-md text-xs font-semibold transition-all ${
+                className={`px-2 py-2.5 md:py-1.5 min-h-11 md:min-h-0 rounded-md text-xs font-semibold transition-all ${
                   tab === t.id
                     ? 'bg-white text-brand-main shadow-sm'
                     : 'text-slate-500 hover:text-brand-main'
@@ -667,11 +667,11 @@ export default function MarginCalculatorModal({ onClose }) {
           {tab === 'margin' && <MarginPercentTab />}
         </div>
 
-        <div className="px-5 pb-5">
+        <div className="px-5 pb-[max(1.25rem,env(safe-area-inset-bottom))]">
           <button
             type="button"
             onClick={onClose}
-            className="w-full py-2 rounded-lg text-sm font-semibold bg-brand-acc3 text-brand-main hover:opacity-90 transition-opacity"
+            className="w-full py-3 md:py-2 min-h-11 rounded-lg text-sm font-semibold bg-brand-acc3 text-brand-main hover:opacity-90 transition-opacity"
           >
             Close
           </button>

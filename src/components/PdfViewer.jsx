@@ -121,6 +121,9 @@ export default function PdfViewer({
   const [pageHighlights, setPageHighlights] = useState({})
   const [exporting, setExporting] = useState(false)
   const [exportError, setExportError] = useState('')
+  /** Fit-to-width page size for phone viewports (iPhone 16 ~393 CSS px). */
+  const [fitWidth, setFitWidth] = useState(null)
+  const [isPhone, setIsPhone] = useState(false)
 
   const scrollRef = useRef(null)
   const pageRefs = useRef({})
@@ -132,6 +135,7 @@ export default function PdfViewer({
   const totalPages = numPages || 1
   const safePage = Math.min(Math.max(activePage, 1), totalPages)
   const renderScale = zoom * BASE_SCALE
+  const pageWidth = isPhone && fitWidth ? Math.round(fitWidth * zoom) : null
 
   const visibleErrors = errors.filter((e) => !e.hidden)
 
@@ -142,6 +146,28 @@ export default function PdfViewer({
     setPageHighlights({})
     pageRefs.current = {}
     highlightAnchorRefs.current = {}
+  }, [pdfUrl])
+
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 767px)')
+    const syncPhone = () => setIsPhone(mq.matches)
+    syncPhone()
+    mq.addEventListener('change', syncPhone)
+    return () => mq.removeEventListener('change', syncPhone)
+  }, [])
+
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return undefined
+    const measure = () => {
+      const phone = window.matchMedia('(max-width: 767px)').matches
+      const pad = phone ? 12 : 32
+      setFitWidth(Math.max(260, el.clientWidth - pad))
+    }
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
   }, [pdfUrl])
 
   useEffect(() => {
@@ -305,7 +331,7 @@ export default function PdfViewer({
     )
     return () => timers.forEach((id) => window.clearTimeout(id))
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [numPages, errorHighlightKey, zoom, pdfUrl])
+  }, [numPages, errorHighlightKey, zoom, pdfUrl, pageWidth])
 
   useEffect(() => {
     scheduleMeasureMarkers()
@@ -479,9 +505,9 @@ export default function PdfViewer({
 
   return (
     <div className="flex flex-col h-full min-h-0 bg-brand-main overflow-hidden">
-      <div className="flex items-center justify-between gap-2 px-4 py-2.5 shrink-0 bg-black/25 border-b border-white/10">
+      <div className="flex items-center justify-between gap-2 px-2 md:px-4 py-1.5 md:py-2.5 shrink-0 bg-black/25 border-b border-white/10">
         <span
-          className="text-xs font-medium text-white/50 font-mono truncate min-w-0"
+          className="text-[11px] md:text-xs font-medium text-white/50 font-mono truncate min-w-0"
           title={pdfFile?.name}
         >
           {pdfFile?.name || 'customer_quote.pdf'}
@@ -490,16 +516,19 @@ export default function PdfViewer({
           type="button"
           onClick={handleExportAnnotated}
           disabled={!pdfFile || exporting}
-          className="shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold bg-brand-secondary/20 text-brand-secondary hover:bg-brand-secondary/30 disabled:opacity-40 transition-colors"
+          className="shrink-0 inline-flex items-center gap-1 md:gap-1.5 px-2 md:px-2.5 py-1 rounded-md text-[11px] font-semibold bg-brand-secondary/20 text-brand-secondary hover:bg-brand-secondary/30 disabled:opacity-40 transition-colors"
           title="Export Annotated PDF"
           aria-label="Export Annotated PDF"
         >
           <Download className="w-3.5 h-3.5" />
-          {exporting ? 'Exporting…' : 'Export Annotated PDF'}
+          <span className="md:hidden">{exporting ? '…' : 'Export'}</span>
+          <span className="hidden md:inline">
+            {exporting ? 'Exporting…' : 'Export Annotated PDF'}
+          </span>
         </button>
       </div>
       {exportError ? (
-        <div className="shrink-0 px-4 py-1.5 text-[11px] text-brand-acc1 bg-brand-acc1/10 border-b border-brand-acc1/30">
+        <div className="shrink-0 px-3 md:px-4 py-1 md:py-1.5 text-[11px] text-brand-acc1 bg-brand-acc1/10 border-b border-brand-acc1/30">
           {exportError}
         </div>
       ) : null}
@@ -507,8 +536,8 @@ export default function PdfViewer({
       <div className="relative flex-1 min-h-0">
         <div
           ref={scrollRef}
-          className="pdf-scroll absolute inset-0 overflow-y-scroll overflow-x-auto p-4"
-          style={{ scrollbarGutter: 'stable' }}
+          className="pdf-scroll absolute inset-0 overflow-y-scroll overflow-x-hidden md:overflow-x-auto p-1.5 md:p-4"
+          style={{ scrollbarGutter: isPhone ? 'auto' : 'stable' }}
         >
           {!pdfUrl ? (
             <div className="flex flex-col items-center justify-center h-full text-white/40 gap-2">
@@ -519,12 +548,18 @@ export default function PdfViewer({
             <Document
               file={pdfUrl}
               loading={
-                <div className="bg-white rounded shadow-2xl w-[420px] min-h-[540px] mx-auto flex items-center justify-center text-sm text-slate-500">
+                <div
+                  className="bg-white rounded shadow-2xl min-h-[240px] md:min-h-[540px] mx-auto flex items-center justify-center text-sm text-slate-500"
+                  style={{ width: pageWidth || 420 }}
+                >
                   Loading PDF…
                 </div>
               }
               error={
-                <div className="bg-white rounded shadow-2xl w-[420px] min-h-[200px] mx-auto flex items-center justify-center text-sm text-brand-acc1 px-6 text-center">
+                <div
+                  className="bg-white rounded shadow-2xl min-h-[160px] md:min-h-[200px] mx-auto flex items-center justify-center text-sm text-brand-acc1 px-6 text-center"
+                  style={{ width: pageWidth || 420, maxWidth: '100%' }}
+                >
                   {loadError || 'Could not load this PDF. Try another file.'}
                 </div>
               }
@@ -536,7 +571,7 @@ export default function PdfViewer({
                 setLoadError(err?.message || 'Failed to load PDF')
               }}
             >
-              <div className="mx-auto w-max flex flex-col gap-4">
+              <div className="mx-auto w-full md:w-max flex flex-col gap-2 md:gap-4 items-center">
                 {Array.from({ length: totalPages }, (_, i) => {
                   const pageNumber = i + 1
                   const pageErrors = visibleErrors.filter(
@@ -554,14 +589,14 @@ export default function PdfViewer({
                         if (el) pageRefs.current[pageNumber] = el
                         else delete pageRefs.current[pageNumber]
                       }}
-                      className="relative"
+                      className="relative max-w-full"
                     >
                       {pageErrors.map((error, idx) => (
                         <button
                           key={`badge-${error.id}`}
                           type="button"
                           onClick={() => onSelectError?.(error.id)}
-                          className={`absolute -left-2 z-20 w-6 h-6 rounded-full flex items-center justify-center text-white text-[11px] font-bold font-mono shadow-lg transition-transform ${
+                          className={`absolute z-20 w-5 h-5 md:w-6 md:h-6 rounded-full flex items-center justify-center text-white text-[10px] md:text-[11px] font-bold font-mono shadow-lg transition-transform left-1 md:-left-2 top-auto ${
                             error.severity === 'CRITICAL'
                               ? 'bg-brand-acc1'
                               : error.severity === 'WARNING'
@@ -572,7 +607,7 @@ export default function PdfViewer({
                               ? 'scale-125 ring-[3px] ring-white/30'
                               : 'hover:scale-110'
                           }`}
-                          style={{ top: `${12 + idx * 28}px` }}
+                          style={{ top: `${8 + idx * 24}px` }}
                           title={`${error.severity} #${error.id}${error.sku ? ` · ${error.sku}` : ''}`}
                         >
                           {error.id}
@@ -581,8 +616,10 @@ export default function PdfViewer({
 
                       <Page
                         pageNumber={pageNumber}
-                        scale={renderScale}
-                        className="shadow-2xl rounded overflow-hidden bg-white"
+                        {...(pageWidth
+                          ? { width: pageWidth }
+                          : { scale: renderScale })}
+                        className="shadow-2xl rounded overflow-hidden bg-white max-w-full"
                         renderTextLayer
                         renderAnnotationLayer
                         onRenderSuccess={() => {
@@ -691,8 +728,8 @@ export default function PdfViewer({
         )}
       </div>
 
-      <div className="shrink-0 z-20 flex items-center justify-between px-4 py-2.5 bg-black/40 border-t border-white/10 backdrop-blur-sm">
-        <div className="flex items-center gap-1">
+      <div className="shrink-0 z-20 flex items-center justify-between px-2 md:px-4 py-1.5 md:py-2.5 bg-black/40 border-t border-white/10 backdrop-blur-sm">
+        <div className="flex items-center gap-0.5 md:gap-1">
           <button
             type="button"
             onClick={handlePrev}
@@ -702,8 +739,8 @@ export default function PdfViewer({
           >
             <ChevronLeft className="w-4 h-4" />
           </button>
-          <span className="text-xs px-2 text-white/60 font-mono">
-            Page {safePage} of {totalPages}
+          <span className="text-[11px] md:text-xs px-1.5 md:px-2 text-white/60 font-mono">
+            {safePage}/{totalPages}
           </span>
           <button
             type="button"
