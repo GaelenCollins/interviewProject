@@ -7,7 +7,10 @@ import {
   Layers,
   Mail,
   MessageCircle,
+  Play,
 } from 'lucide-react'
+
+const DEMO_VIDEO_HREF = 'https://youtu.be/FqAsSe1OL0k'
 
 const CONTACT_HUMAN_HREF =
   'mailto:GaelenCollins@dynamixgroup.com?subject=' +
@@ -126,6 +129,17 @@ export default function Header({
                 <MessageCircle className="w-4 h-4 shrink-0" strokeWidth={2} />
                 Send Tool Feedback
               </a>
+              <a
+                role="menuitem"
+                href={DEMO_VIDEO_HREF}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={() => setMoreOpen(false)}
+                className="w-full flex items-center gap-2 px-3 py-3 text-left text-xs font-medium text-brand-main hover:bg-slate-50 min-h-11"
+              >
+                <Play className="w-4 h-4 shrink-0" strokeWidth={2} />
+                Demo Video
+              </a>
             </div>
           ) : null}
         </div>
@@ -170,6 +184,17 @@ export default function Header({
           >
             <MessageCircle className="w-3.5 h-3.5 shrink-0" strokeWidth={2} />
             <span className="whitespace-nowrap">Send Tool Feedback</span>
+          </a>
+          <a
+            href={DEMO_VIDEO_HREF}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={ghostBtnClass}
+            title="Watch demo video"
+            aria-label="Watch demo video"
+          >
+            <Play className="w-3.5 h-3.5 shrink-0" strokeWidth={2} />
+            <span className="whitespace-nowrap">Demo Video</span>
           </a>
         </div>
 
